@@ -35,7 +35,7 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/boot.h>
-#include <libkern/libkern.h>
+#include <libsa/string.h>
 #include <vm/pmap.h>
 
 #define wlog(...) b2l_early_trace("B2L WIFI: " __VA_ARGS__)
