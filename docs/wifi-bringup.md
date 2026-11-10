@@ -170,11 +170,13 @@ Look for all three results: `Gen1 link up`, `Gen1 quiesce verified`, and
 
 ## Read-only endpoint identity
 
-The userspace loader now selects `b2l_wifi_diag=5`. It repeats the verified
+`b2l_wifi_diag=5` repeats the verified
 Gen1 sequence, then reads only CFG0 words at offsets `0x00`, `0x04`, `0x08`
 and `0x2c` for bus 1/device 0/function 0. These contain vendor/device IDs,
-command/status, PCI class/revision and subsystem IDs. The physical outcome
-of this additional checkpoint is pending.
+command/status, PCI class/revision and subsystem IDs. This checkpoint completed
+on the phone: `14e4:4475`, subsystem `14e4:4375`, PCI revision 5, class
+`0x028000`, command zero, followed by verified CFG0/PHY/power cleanup and
+interactive Home.
 
 The live DT's configuration resource is `0x14ffe000`, length `0x2000`.
 Samsung splits it into 4 KiB CFG0 and CFG1 halves and uses outbound viewport
@@ -218,6 +220,49 @@ quiescence failure result, and does not suppress the common PHY/power cleanup.
 Require `endpoint identity verified`, `endpoint probe end: stage=complete
 cleanup=verified`, `Gen1 quiesce verified` and `power probe restore verified`.
 
+## Internal chip identity
+
+The userspace loader now selects `b2l_wifi_diag=6`. After the verified endpoint
+identity it temporarily assigns the first BAR0 aperture and Broadcom's
+`PCI_BAR0_WIN` to read three chipcommon words: chip ID at `0x00`, capabilities
+at `0x04` and the EROM pointer at `0xfc`. Its hardware outcome is pending.
+There are no chip register writes, RAM mappings, core resets, firmware loads,
+interrupts or DMA clients in this checkpoint.
+
+Recovery's cached BAR0 is a 64 KiB, non-prefetchable 64-bit aperture at
+`0x14400000`; the separate 4 MiB RAM aperture is not used. Mode 6 maps a
+16 KiB envelope at `0x14400000`, but programs outbound ATU0 for only the first
+4 KiB, with CPU and PCI base `0x14400000` and limit `0x14400fff`. ATU0 must
+initially have zero control. Other active or invalid ATU0 state skips the
+probe. Mode 5 still programs no memory translation or endpoint register.
+
+The probe saves endpoint command, BAR0 low/high and vendor window. It accepts
+only I/O/memory/master command bits zero, high BAR0 zero, and low BAR0 either
+`4` (unassigned 64-bit memory) or `0x14400004` (the measured recovery address).
+It does not write a sizing pattern or access BAR2. With memory decoding still
+off it programs/checks BAR0 and PCI configuration offset `0x80` to
+`0x18000000`, the pinned Broadcom enumeration base. It then enables endpoint
+memory decoding only, preserving other command bits and writing zero to
+status W1C bits. Endpoint and root bus mastering remain disabled.
+
+The three reads share a 100 ms deadline. Before each, the probe verifies
+the memory route, CFG0 prerequisites, Gen1 x1, root command, endpoint command,
+BAR0 and vendor window. A bad chip ID or all-ones word stops further reads.
+Success requires chip ID `0x4375`; revision/package/interconnect fields are
+decoded using Broadcom's `CID_*` masks. The EROM pointer is logged but never
+followed. Neither the PCI revision nor the internal chip revision alone
+selects the board's NVRAM variant.
+
+Cleanup first disables endpoint memory decoding with checked bounded retries.
+Only after that succeeds does it restore the saved window and BAR0 words.
+It disables its owned ATU0 and returns viewport selection to CFG0, then mode 5
+performs its normal CFG0/bus/viewport cleanup. If link prerequisites fail, no
+further endpoint request is issued. Inaccessible or failed restoration is
+explicit, contributes to the overall quiescence failure result, and still
+permits PERST assertion and common PHY/power shutdown. Descriptor contents
+remain programmed while disabled. A successful chip read and successful
+cleanup are separate results.
+
 ## Recovery evidence
 
 With one rooted beyond2lte in TWRP, collect cached PCI IDs, resources, driver
@@ -242,9 +287,9 @@ open; no random variant is used.
 
 ## Following checkpoints
 
-1. Validate the bounded endpoint identity reads and CFG0/PHY/power cleanup,
-   preserving the validated Gen1 BOOT as rollback.
-2. Read the backplane chip revision, select verified board firmware/NVRAM,
+1. Validate internal chip identity and BAR0/ATU/PHY/power cleanup, preserving
+   the validated endpoint-identity BOOT as rollback.
+2. Enumerate the required internal cores, select verified board firmware/NVRAM,
    and bring up firmware with an appropriate DMA/SysMMU design.
 3. Establish scanning, authentication, packet transport and DHCP, then adapt
    the HakiOS network and Apple80211 interfaces to this iOS release.
@@ -289,6 +334,14 @@ power restoration still runs. Prior viewport selection and root bus numbers
 are restored, including a previously selected inbound viewport. No endpoint
 writes, memory/inbound region programming or BAR access is permitted.
 
+Mode 6 tests the exact first-page memory translation, three ordered chip reads,
+64-bit BAR0/window setup, W1C-safe memory-only command and restoration. It
+exercises all eleven mapping failures, every dropped write, wrong/all-ones
+chip words, deadline expiry, unexpected BAR/window state, occupied ATU0 and
+failed enable. Permanent command/window/ATU0 cleanup failures and link loss
+remain explicit while common power restoration still runs. The backend rejects
+endpoint bus mastering, BAR2/RAM access and every chip-register write.
+
 ## Source references
 
 Samsung/LineageOS is pinned to
@@ -301,6 +354,11 @@ Samsung/LineageOS is pinned to
 - [DesignWare root-port link setup](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pci/dwc/pcie-designware.c)
 - [DesignWare root configuration semantics](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pci/dwc/pcie-designware-host.c)
 - [GPIO bank offsets](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c)
+- [Broadcom BAR0 window definitions](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/pcicfg.h)
+- [Broadcom enumeration base](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/hndsoc.h)
+- [Chipcommon layout and identity masks](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/sbchipc.h)
+- [Broadcom chip attachment and identity decoding](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/siutils.c)
+- [Broadcom PCIe chip-ID reader](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_pcie.c)
 - [Clock register bases, offsets and fields](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/soc/samsung/cal-if/exynos9820/cmucal-sfr.c)
 - [WLAN power and PCIe channel setup](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_custom_exynos.c)
 

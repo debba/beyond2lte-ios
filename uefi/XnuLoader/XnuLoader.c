@@ -385,7 +385,7 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "b2l_rtc_wait=0 b2l_boot_timing=1 b2l_console_quiet=1 "
                 "b2l_cache_interactive=1 b2l_ax_seed=1 b2l_dvfs=2 "
                 "b2l_dvfs_cl0=1950000 b2l_dvfs_cl1=2002000 b2l_dvfs_cl2=2080000 "
-                "b2l_wifi_diag=5 "
+                "b2l_wifi_diag=6 "
 #else
                 "rd=b2l-diagnostic b2l_root_rw=0 b2l_system_log=0 b2l_native_cache=0 "
 #endif

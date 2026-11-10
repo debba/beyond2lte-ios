@@ -12,6 +12,9 @@
  * endpoint configuration/BAR, DMA mapping, IRQ enabling or firmware loading.
  * b2l_wifi_diag=5 additionally reads four endpoint configuration words through
  * a temporary outbound CFG0 region, then disables it. No endpoint writes.
+ * b2l_wifi_diag=6 additionally sets a temporary BAR0/window and memory-only
+ * endpoint command for three chipcommon reads. Never enables bus mastering,
+ * maps dongle RAM, writes chip registers or loads firmware.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -129,12 +132,184 @@ wifi_reset_pulse(const struct wifi_region *elbi, unsigned off, unsigned final_us
     return -1;
 }
 
+static int
+wifi_atu_enable(const struct wifi_region *dbi, unsigned index)
+{
+    uint32_t control = 0;
+    wifi_write(dbi, 0x908, 0x80000000);
+    for (unsigned attempt = 0; attempt < 5; attempt++) {
+        control = wifi_read(dbi, 0x908);
+        if (control == 0x80000000) return 0;
+        if (control == UINT32_MAX) break;
+        delay_for_interval(9, NSEC_PER_MSEC);
+    }
+    wlog("ATU%u enable failed: readback=%#x\n", index, control);
+    return -1;
+}
+
+static int
+wifi_cfg_ready(struct wifi_region *regions, uint64_t deadline)
+{
+    const struct wifi_region *elbi = &regions[4], *dbi = &regions[8];
+    uint32_t link = wifi_read(elbi, 0x74), status = wifi_read(dbi, 0x80);
+    uint32_t command = wifi_read(dbi, 0x04), viewport = wifi_read(dbi, 0x900);
+    if (mach_absolute_time() >= deadline || link == UINT32_MAX ||
+        (link & 31u) < 0x0d || (link & 31u) > 0x14 || status == UINT32_MAX ||
+        ((status >> 16) & 15u) != 1 || ((status >> 20) & 63u) != 1 ||
+        command == UINT32_MAX || (command & 0x147u) != 2 || viewport != 1) return 0;
+    return wifi_read(dbi, 0x908) == 0x80000000;
+}
+
+static int
+wifi_cfg_write_checked(struct wifi_region *regions, unsigned offset, uint32_t value,
+    uint64_t deadline)
+{
+    if (!wifi_cfg_ready(regions, deadline)) return -1;
+    const struct wifi_region *cfg = &regions[9];
+    wifi_write(cfg, 0x2000 + offset, value);
+    if (!wifi_cfg_ready(regions, deadline)) return -1;
+    uint32_t checked = wifi_read(cfg, 0x2000 + offset);
+    if (checked == value) return 0;
+    wlog("BAR0 config mismatch off=%#x got=%#x want=%#x\n", offset, checked, value);
+    return -1;
+}
+
+static int
+wifi_ep_memory_command(struct wifi_region *regions, uint32_t value, uint64_t deadline)
+{
+    if (!wifi_cfg_ready(regions, deadline)) return -1;
+    const struct wifi_region *cfg = &regions[9];
+    uint32_t before = wifi_read(cfg, 0x2004);
+    if (before == UINT32_MAX || (value != 0 && value != 2)) return -1;
+    wifi_write(cfg, 0x2004, ((before & 0xffffu) & ~7u) | value);
+    if (!wifi_cfg_ready(regions, deadline)) return -1;
+    uint32_t checked = wifi_read(cfg, 0x2004);
+    if (checked != UINT32_MAX && (checked & 7u) == value) return 0;
+    wlog("BAR0 memory command mismatch got=%#x want=%#x; BME never requested\n", checked, value);
+    return -1;
+}
+
+static int
+wifi_cfg_restore(struct wifi_region *regions, unsigned offset, uint32_t value)
+{
+    for (unsigned attempt = 0; attempt < 3; attempt++) {
+        if (!wifi_cfg_write_checked(regions, offset, value, UINT64_MAX)) return 0;
+        delay_for_interval(1, NSEC_PER_MSEC);
+    }
+    return -1;
+}
+
+static int
+wifi_chipcommon_probe(struct wifi_region *regions)
+{
+    const struct wifi_region *dbi = &regions[8], *cfg = &regions[9], *bar = &regions[10];
+    static const struct { unsigned off; uint32_t value; } descriptor[] = {
+        { 0x90c, 0x14400000 }, { 0x910, 0 }, { 0x914, 0x14400fff },
+        { 0x918, 0x14400000 }, { 0x91c, 0 }, { 0x904, 0 },
+    };
+    static const unsigned offsets[] = { 0, 4, 0xfc };
+    uint32_t words[3] = { 0 }, low = 0, high = 0, window = 0, command = 0;
+    int atu_owned = 0, ep_changed = 0, cleanup_failed = 0;
+    const char *stage = "initial-state";
+    uint64_t deadline;
+    clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+    if (!wifi_cfg_ready(regions, deadline)) {
+        wlog("chipcommon probe skipped: configuration prerequisites\n");
+        return 0;
+    }
+    /* Cached recovery resources establish BAR0 as a 64 KiB 64-bit aperture at
+     * 0x14400000. Do not size-probe BARs or touch BAR2's dongle RAM aperture. */
+    static const unsigned config_offsets[] = { 0x04, 0x10, 0x14, 0x80 };
+    uint32_t saved[4];
+    for (unsigned i = 0; i < sizeof(config_offsets) / sizeof(config_offsets[0]); i++) {
+        if (!wifi_cfg_ready(regions, deadline)) {
+            wlog("chipcommon probe skipped before config +%#x: prerequisites\n", config_offsets[i]);
+            return 0;
+        }
+        saved[i] = wifi_read(cfg, 0x2000 + config_offsets[i]);
+    }
+    command = saved[0]; low = saved[1]; high = saved[2]; window = saved[3];
+    if (command == UINT32_MAX || (command & 7u) || high != 0 ||
+        (low != 4 && low != 0x14400004) || window == UINT32_MAX) {
+        wlog("chipcommon probe skipped: command=%#x BAR0=%#x:%#x window=%#x\n",
+            command, high, low, window);
+        return 0;
+    }
+    wlog("chipcommon probe begin: BAR0 first 4 KiB only; no chip writes, RAM, DMA or firmware\n");
+    if (wifi_bits(dbi, 0x900, UINT32_MAX, 0)) goto out;
+    uint32_t control = wifi_read(dbi, 0x908);
+    if (control != 0) {
+        wlog("chipcommon probe skipped: outbound ATU0 control=%#x is not inactive zero\n", control);
+        goto out;
+    }
+    atu_owned = 1;
+    stage = "bar0-route";
+    for (unsigned i = 0; i < sizeof(descriptor) / sizeof(descriptor[0]); i++) {
+        wifi_write(dbi, descriptor[i].off, descriptor[i].value);
+        if (wifi_read(dbi, descriptor[i].off) != descriptor[i].value) goto out;
+    }
+    if (wifi_atu_enable(dbi, 0) ||
+        wifi_bits(dbi, 0x900, UINT32_MAX, 1)) goto out;
+    stage = "bar0-config";
+    ep_changed = 1;
+    if (wifi_cfg_write_checked(regions, 0x14, 0, deadline) ||
+        wifi_cfg_write_checked(regions, 0x10, 0x14400004, deadline) ||
+        wifi_cfg_write_checked(regions, 0x80, 0x18000000, deadline) ||
+        wifi_ep_memory_command(regions, 2, deadline)) goto out;
+    stage = "chipcommon-reads";
+    for (unsigned i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+        if (wifi_bits(dbi, 0x900, UINT32_MAX, 0)) goto out;
+        control = wifi_read(dbi, 0x908);
+        if (wifi_bits(dbi, 0x900, UINT32_MAX, 1) || control != 0x80000000 ||
+            !wifi_cfg_ready(regions, deadline) ||
+            (wifi_read(cfg, 0x2004) & 7u) != 2 ||
+            wifi_read(cfg, 0x2010) != 0x14400004 || wifi_read(cfg, 0x2014) != 0 ||
+            wifi_read(cfg, 0x2080) != 0x18000000) goto out;
+        words[i] = wifi_read(bar, offsets[i]);
+        wlog("chipcommon +%#x raw=%#x\n", offsets[i], words[i]);
+        if (words[i] == UINT32_MAX || (i == 0 && (words[i] & 0xffffu) != 0x4375)) goto out;
+    }
+    wlog("chipcommon identity verified: chip=%#x revision=%u package=%u interconnect=%u; EROM=%#x not followed\n",
+        words[0] & 0xffffu, (words[0] >> 16) & 15u, (words[0] >> 20) & 15u,
+        words[0] >> 28, words[2]);
+    stage = "complete";
+out:
+    /* Disable memory decoding before restoring BARs. PCI status W1C bits are
+     * written as zero; bus mastering was never enabled. If the link is lost,
+     * do not issue more config requests; caller still asserts PERST/power off. */
+    int cfg_selected = !wifi_restore_bits(dbi, 0x900, UINT32_MAX, 1);
+    if (!cfg_selected) cleanup_failed = -1;
+    if (ep_changed) {
+        int disabled = 0;
+        for (unsigned attempt = 0; cfg_selected && attempt < 3; attempt++) {
+            if (!wifi_ep_memory_command(regions, 0, UINT64_MAX)) {
+                disabled = 1; break;
+            }
+            delay_for_interval(1, NSEC_PER_MSEC);
+        }
+        if (!disabled) cleanup_failed = -1;
+        else {
+            cleanup_failed |= wifi_cfg_restore(regions, 0x80, window);
+            cleanup_failed |= wifi_cfg_restore(regions, 0x14, high);
+            cleanup_failed |= wifi_cfg_restore(regions, 0x10, low);
+        }
+    }
+    if (atu_owned) {
+        if (wifi_restore_bits(dbi, 0x900, UINT32_MAX, 0)) cleanup_failed = -1;
+        else cleanup_failed |= wifi_restore_bits(dbi, 0x908, UINT32_MAX, 0);
+    }
+    cleanup_failed |= wifi_restore_bits(dbi, 0x900, UINT32_MAX, 1);
+    wlog("chipcommon probe end: stage=%s cleanup=%s; BAR0 decoding and owned ATU0 disable requested\n",
+        stage, cleanup_failed ? "FAILED" : "verified");
+    return cleanup_failed;
+}
+
 /* Samsung uses outbound viewport 1 for CFG0, bus 1/device 0/function 0.
  * The live DT's 0x14ffe000/0x2000 config resource is split into two 4 KiB
  * CFG0/CFG1 halves. Map a 16 KiB aligned envelope but read only four words
  * in CFG0. Never map a BAR, program a memory/inbound region or write the EP. */
 static int
-wifi_endpoint_identity(struct wifi_region *regions)
+wifi_endpoint_identity(struct wifi_region *regions, uint32_t mode)
 {
     const struct wifi_region *elbi = &regions[4], *dbi = &regions[8], *cfg = &regions[9];
     static const unsigned offsets[] = { 0x00, 0x04, 0x08, 0x2c };
@@ -178,18 +353,7 @@ wifi_endpoint_identity(struct wifi_region *regions)
         }
     }
     /* DesignWare enable readback: one write and at most five 9 ms waits. */
-    wifi_write(dbi, 0x908, 0x80000000);
-    int enabled = 0;
-    for (unsigned attempt = 0; attempt < 5; attempt++) {
-        control = wifi_read(dbi, 0x908);
-        if (control == 0x80000000) { enabled = 1; break; }
-        if (control == UINT32_MAX) break;
-        delay_for_interval(9, NSEC_PER_MSEC);
-    }
-    if (!enabled) {
-        wlog("endpoint probe stopped: ATU1 enable readback=%#x\n", control);
-        goto out;
-    }
+    if (wifi_atu_enable(dbi, 1)) goto out;
     /* Conservative fixed readiness interval; no retry of endpoint requests. */
     delay_for_interval(100, NSEC_PER_MSEC);
     uint64_t deadline;
@@ -216,13 +380,17 @@ wifi_endpoint_identity(struct wifi_region *regions)
     wlog("endpoint identity verified: 14e4:4475 subsystem 14e4:4375 PCI revision=%u class=%#x; no BAR/DMA/firmware\n",
         words[2] & 255u, words[2] >> 8);
     stage = "complete";
+    if (mode == 6) cleanup_failed |= wifi_chipcommon_probe(regions);
 out:
     /* Leave our outbound descriptor disabled, retaining its programming bytes.
      * Restore root bus numbers and viewport selection before PHY shutdown. */
-    if (atu_owned) cleanup_failed |= wifi_restore_bits(dbi, 0x908, UINT32_MAX, 0);
+    if (atu_owned) {
+        if (wifi_restore_bits(dbi, 0x900, UINT32_MAX, 1)) cleanup_failed = -1;
+        else cleanup_failed |= wifi_restore_bits(dbi, 0x908, UINT32_MAX, 0);
+    }
     if (buses_changed) cleanup_failed |= wifi_restore_bits(dbi, 0x18, 0xffffff, buses);
     if (viewport_changed) cleanup_failed |= wifi_restore_bits(dbi, 0x900, UINT32_MAX, viewport);
-    wlog("endpoint probe end: stage=%s cleanup=%s; CFG0 disable requested when owned, no endpoint writes\n",
+    wlog("endpoint probe end: stage=%s cleanup=%s; owned CFG0 disable requested; no firmware/networking\n",
         stage, cleanup_failed ? "FAILED" : "verified");
     return cleanup_failed;
 }
@@ -348,12 +516,12 @@ wifi_gen1_probe(struct wifi_region *regions, uint32_t mode)
     }
     wlog("Gen1 link %s: ELBI=%#x speed=%u lanes=%u; endpoint/DMA/firmware untouched\n",
         trained ? "up" : "not established", link, (status >> 16) & 15u, (status >> 20) & 63u);
-    if (trained && mode == 5) {
+    if (trained && mode >= 5) {
         if (wifi_bits(pcs, 0xec, 8, 8)) {
             wlog("endpoint probe skipped: DBI access prerequisite failed\n");
             goto out;
         }
-        cleanup_failed |= wifi_endpoint_identity(regions);
+        cleanup_failed |= wifi_endpoint_identity(regions, mode);
     }
 out:
     if (!trained) wlog("Gen1 probe stopped: stage=%s polls=%u last_ELBI=%#x\n", stage, polls, link);
@@ -442,7 +610,7 @@ wifi_power_probe(struct wifi_region *regions, uint32_t mode)
     }
     wlog("power probe begin: hold PERST low; temporary WLAN power and PHY bypass\n");
     /* Program low latches before selecting output. Modes 2/3 hold reset; mode
-     * 4/5 temporarily release/reassert it inside the separate link probe. */
+     * 4..6 temporarily release/reassert it inside the separate link probe. */
     int failed = wifi_bits(&regions[2], 0x24, reset_level, 0) ||
         wifi_bits(&regions[2], 0x20, reset_function, 1u << 8) ||
         wifi_bits(&regions[1], 0x84, wlan_level, 0) ||
@@ -485,19 +653,21 @@ b2l_wifi_diag_start(void)
         { 0x13ee0000, 0, 0x4000 }, /* PCIe0 PCS */
         { 0x13c10000, 0, 0x4000 }, /* SYSREG_FSYS1, PCIe0 fields only */
         { 0x13f00000, 0, 0x4000 }, /* PCIe0 root DBI */
-        { 0x14ffc000, 0, 0x4000 }, /* Mode 5: only CFG0 +0x2000 is readable */
+        { 0x14ffc000, 0, 0x4000 }, /* Modes 5/6: only CFG0 +0x2000 */
+        { 0x14400000, 0, 0x4000 }, /* Mode 6: BAR0 first-page chipcommon reads */
     };
     static const unsigned gates[] = { 0x2030, 0x2034, 0x2038, 0x203c, 0x2040, 0x2044 };
     static const unsigned qch[] = { 0x3034, 0x3038, 0x303c, 0x3040, 0x3044 };
     unsigned count = 4;
 
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 5) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 6) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }
     if (mode == 3) count = 5;
     if (mode == 4) count = 9;
-    if (mode == 5) count = sizeof(regions) / sizeof(regions[0]);
+    if (mode == 5) count = 10;
+    if (mode == 6) count = sizeof(regions) / sizeof(regions[0]);
     /* Map every shared block before reading any of them. Release all mappings
      * even when an allocation fails. Mode 3 also maps ELBI, but cannot read it
      * until the verified power/reset/isolation sequence has completed. */
