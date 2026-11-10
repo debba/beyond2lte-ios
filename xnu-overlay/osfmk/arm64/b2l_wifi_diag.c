@@ -15,6 +15,8 @@
  * b2l_wifi_diag=6 additionally sets a temporary BAR0/window and memory-only
  * endpoint command for three chipcommon reads. Never enables bus mastering,
  * maps dongle RAM, writes chip registers or loads firmware.
+ * b2l_wifi_diag=7 also captures the measured AI EROM page, without following
+ * its address descriptors or reading its control registers.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -200,7 +202,59 @@ wifi_cfg_restore(struct wifi_region *regions, unsigned offset, uint32_t value)
 }
 
 static int
-wifi_chipcommon_probe(struct wifi_region *regions)
+wifi_bar_ready(struct wifi_region *regions, uint32_t window, uint64_t deadline)
+{
+    const struct wifi_region *dbi = &regions[8], *cfg = &regions[9];
+    if (wifi_bits(dbi, 0x900, UINT32_MAX, 0)) return 0;
+    uint32_t control = wifi_read(dbi, 0x908);
+    if (wifi_bits(dbi, 0x900, UINT32_MAX, 1) || control != 0x80000000 ||
+        !wifi_cfg_ready(regions, deadline) || (wifi_read(cfg, 0x2004) & 7u) != 2 ||
+        wifi_read(cfg, 0x2010) != 0x14400004 || wifi_read(cfg, 0x2014) != 0 ||
+        wifi_read(cfg, 0x2080) != window) return 0;
+    return 1;
+}
+
+static int
+wifi_erom_capture(struct wifi_region *regions)
+{
+    /* aidmp.h puts ER_REMAPCONTROL at 0xe00. Never read it or later registers.
+     * An exact ER_END|ER_VALID (0xf) terminates only at a tagged-entry boundary;
+     * 64-bit address/size extensions are untagged data and may also equal 0xf. */
+    unsigned state = 0, size_follows = 0;
+    uint64_t deadline;
+    clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+    wlog("EROM capture begin: measured page=0x18111000, max=896 words, 100 ms; descriptors not followed\n");
+    for (unsigned i = 0; i < 896; i++) {
+        if (!wifi_bar_ready(regions, 0x18111000, deadline)) {
+            wlog("EROM capture stopped: guard/deadline before word=%u state=%u\n", i, state);
+            return -1;
+        }
+        uint32_t word = wifi_read(&regions[10], i * 4);
+        wlog("EROM +%#x raw=%#x\n", i * 4, word);
+        if (word == UINT32_MAX) {
+            wlog("EROM capture stopped: invalid all-ones word=%u\n", i);
+            return -1;
+        }
+        if (state == 0) {
+            if (word == 0x0f) {
+                wlog("EROM capture complete: words=%u; raw table only, no core access\n", i + 1);
+                return 0;
+            }
+            if ((word & 1u) && (word & 6u) == 4) {
+                size_follows = (word & 0x30u) == 0x30u;
+                if (word & 8u) state = 1; /* 64-bit address high word. */
+                else if (size_follows) state = 2;
+            }
+        } else if (state == 1) state = size_follows ? 2 : 0;
+        else if (state == 2) state = (word & 8u) ? 3 : 0; /* Optional high size. */
+        else state = 0;
+    }
+    wlog("EROM capture stopped: 896-word bound reached without terminator\n");
+    return -1;
+}
+
+static int
+wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
 {
     const struct wifi_region *dbi = &regions[8], *cfg = &regions[9], *bar = &regions[10];
     static const struct { unsigned off; uint32_t value; } descriptor[] = {
@@ -258,13 +312,7 @@ wifi_chipcommon_probe(struct wifi_region *regions)
         wifi_ep_memory_command(regions, 2, deadline)) goto out;
     stage = "chipcommon-reads";
     for (unsigned i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
-        if (wifi_bits(dbi, 0x900, UINT32_MAX, 0)) goto out;
-        control = wifi_read(dbi, 0x908);
-        if (wifi_bits(dbi, 0x900, UINT32_MAX, 1) || control != 0x80000000 ||
-            !wifi_cfg_ready(regions, deadline) ||
-            (wifi_read(cfg, 0x2004) & 7u) != 2 ||
-            wifi_read(cfg, 0x2010) != 0x14400004 || wifi_read(cfg, 0x2014) != 0 ||
-            wifi_read(cfg, 0x2080) != 0x18000000) goto out;
+        if (!wifi_bar_ready(regions, 0x18000000, deadline)) goto out;
         words[i] = wifi_read(bar, offsets[i]);
         wlog("chipcommon +%#x raw=%#x\n", offsets[i], words[i]);
         if (words[i] == UINT32_MAX || (i == 0 && (words[i] & 0xffffu) != 0x4375)) goto out;
@@ -272,6 +320,19 @@ wifi_chipcommon_probe(struct wifi_region *regions)
     wlog("chipcommon identity verified: chip=%#x revision=%u package=%u interconnect=%u; EROM=%#x not followed\n",
         words[0] & 0xffffu, (words[0] >> 16) & 15u, (words[0] >> 20) & 15u,
         words[0] >> 28, words[2]);
+    if (mode == 7) {
+        stage = "erom-prerequisites";
+        if (words[0] != 0x10054375 || words[2] != 0x18111000) {
+            wlog("EROM capture skipped: chip identity/pointer differs from measured baseline\n");
+            goto out;
+        }
+        stage = "erom-window";
+        if (wifi_ep_memory_command(regions, 0, deadline) ||
+            wifi_cfg_write_checked(regions, 0x80, 0x18111000, deadline) ||
+            wifi_ep_memory_command(regions, 2, deadline)) goto out;
+        stage = "erom-capture";
+        if (wifi_erom_capture(regions)) goto out;
+    }
     stage = "complete";
 out:
     /* Disable memory decoding before restoring BARs. PCI status W1C bits are
@@ -380,7 +441,7 @@ wifi_endpoint_identity(struct wifi_region *regions, uint32_t mode)
     wlog("endpoint identity verified: 14e4:4475 subsystem 14e4:4375 PCI revision=%u class=%#x; no BAR/DMA/firmware\n",
         words[2] & 255u, words[2] >> 8);
     stage = "complete";
-    if (mode == 6) cleanup_failed |= wifi_chipcommon_probe(regions);
+    if (mode >= 6) cleanup_failed |= wifi_chipcommon_probe(regions, mode);
 out:
     /* Leave our outbound descriptor disabled, retaining its programming bytes.
      * Restore root bus numbers and viewport selection before PHY shutdown. */
@@ -660,14 +721,14 @@ b2l_wifi_diag_start(void)
     static const unsigned qch[] = { 0x3034, 0x3038, 0x303c, 0x3040, 0x3044 };
     unsigned count = 4;
 
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 6) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 7) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }
     if (mode == 3) count = 5;
     if (mode == 4) count = 9;
     if (mode == 5) count = 10;
-    if (mode == 6) count = sizeof(regions) / sizeof(regions[0]);
+    if (mode >= 6) count = sizeof(regions) / sizeof(regions[0]);
     /* Map every shared block before reading any of them. Release all mappings
      * even when an allocation fails. Mode 3 also maps ELBI, but cannot read it
      * until the verified power/reset/isolation sequence has completed. */

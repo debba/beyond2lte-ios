@@ -222,10 +222,13 @@ cleanup=verified`, `Gen1 quiesce verified` and `power probe restore verified`.
 
 ## Internal chip identity
 
-The userspace loader now selects `b2l_wifi_diag=6`. After the verified endpoint
-identity it temporarily assigns the first BAR0 aperture and Broadcom's
+`b2l_wifi_diag=6` follows the verified endpoint identity. It temporarily assigns
+the first BAR0 aperture and Broadcom's
 `PCI_BAR0_WIN` to read three chipcommon words: chip ID at `0x00`, capabilities
-at `0x04` and the EROM pointer at `0xfc`. Its hardware outcome is pending.
+at `0x04` and the EROM pointer at `0xfc`. This completed on the phone:
+chip ID `0x10054375` (BCM4375, revision 5, package 0, AI interconnect 1),
+capabilities `0x58400009`, EROM pointer `0x18111000`, all cleanup verified and
+interactive Home. The EROM pointer was not followed in this mode.
 There are no chip register writes, RAM mappings, core resets, firmware loads,
 interrupts or DMA clients in this checkpoint.
 
@@ -263,6 +266,33 @@ permits PERST assertion and common PHY/power shutdown. Descriptor contents
 remain programmed while disabled. A successful chip read and successful
 cleanup are separate results.
 
+## Bounded EROM capture
+
+The userspace loader now selects `b2l_wifi_diag=7`. After repeating the verified
+chipcommon reads it accepts only the measured ID `0x10054375` and EROM pointer
+`0x18111000`. With memory decoding off it switches `PCI_BAR0_WIN` to that
+page, verifies it, and re-enables memory decoding only. It uses the same first
+4 KiB BAR0 translation, with no additional CPU mapping or descriptor target.
+The physical outcome of this additional checkpoint is pending.
+
+The raw capture has a 100 ms deadline and a limit of 896 aligned words, ending
+before EROM control offset `0xe00`. Before every read it checks the memory
+route, CFG0/link/root command, endpoint command, BAR0 and current window.
+All-ones data or a failed guard stops the capture. The exact `0x0000000f`
+terminator is recognized only at an entry boundary: untagged high address,
+size and high-size extension words are consumed as data, even if they equal
+the terminator. The capture never follows any address descriptor or reads
+the EROM control registers.
+
+Each line records the ROM offset and raw word. `EROM capture complete` means
+that a terminator was captured within the bounds, not that the component
+table has been validated. Host analysis must verify every offset/count and
+decode the captured table before using core IDs, revisions or addresses.
+Missing data, a deadline, a bound stop or malformed entries must not become
+an invented core map. Normal BAR0/window/ATU/PHY/power cleanup still runs, and
+its result is independent of capture completion. No core is reset, no chip
+register is written, and no RAM, DMA or firmware is used.
+
 ## Recovery evidence
 
 With one rooted beyond2lte in TWRP, collect cached PCI IDs, resources, driver
@@ -287,9 +317,9 @@ open; no random variant is used.
 
 ## Following checkpoints
 
-1. Validate internal chip identity and BAR0/ATU/PHY/power cleanup, preserving
-   the validated endpoint-identity BOOT as rollback.
-2. Enumerate the required internal cores, select verified board firmware/NVRAM,
+1. Capture and validate the EROM component table and all cleanup, preserving
+   the validated chipcommon-identity BOOT as rollback.
+2. Use validated core identities, select verified board firmware/NVRAM,
    and bring up firmware with an appropriate DMA/SysMMU design.
 3. Establish scanning, authentication, packet transport and DHCP, then adapt
    the HakiOS network and Apple80211 interfaces to this iOS release.
@@ -342,6 +372,12 @@ failed enable. Permanent command/window/ATU0 cleanup failures and link loss
 remain explicit while common power restoration still runs. The backend rejects
 endpoint bus mastering, BAR2/RAM access and every chip-register write.
 
+Mode 7 tests the measured EROM window, ordered ROM offsets below `0xe00`,
+the 896-word and deadline bounds, and terminators inside 64-bit address/size
+extension data. It covers invalid data, changed chip/pointer prerequisites,
+loss of link, missing/final-bound terminators, every dropped write in the new
+path, and failed final window/command cleanup with common power restoration.
+
 ## Source references
 
 Samsung/LineageOS is pinned to
@@ -359,6 +395,8 @@ Samsung/LineageOS is pinned to
 - [Chipcommon layout and identity masks](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/sbchipc.h)
 - [Broadcom chip attachment and identity decoding](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/siutils.c)
 - [Broadcom PCIe chip-ID reader](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_pcie.c)
+- [AI EROM format and control-register boundary](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/aidmp.h)
+- [Broadcom AI EROM scan](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/aiutils.c)
 - [Clock register bases, offsets and fields](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/soc/samsung/cal-if/exynos9820/cmucal-sfr.c)
 - [WLAN power and PCIe channel setup](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_custom_exynos.c)
 
