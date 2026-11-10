@@ -11,6 +11,7 @@ struct b2l_dt_config {
     struct b2l_ram_range ram[B2L_RAM_MAX_RANGES];
     unsigned ram_count;
     b2l_u64 native_cache_base, native_cache_size;
+    b2l_u64 wifi_firmware_base, wifi_firmware_size;
     b2l_u64 secondary_base, secondary_size;
     b2l_u64 touch_status[24];
     b2l_u32 counter_frequency;

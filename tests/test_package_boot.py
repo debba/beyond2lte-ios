@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression coverage for nested GenFv section streams in the real FD check."""
 import importlib.util
+import hashlib
 import lzma
 from pathlib import Path
 import struct
@@ -122,6 +123,28 @@ class BootTrailerTests(unittest.TestCase):
         header = struct.pack("<8sIIQQ", b"B2LXNU01", 1, 128, 4096, 128) + bytes(range(64)) + bytes(32)
         with self.assertRaisesRegex(ValueError, "legacy.*64.*256"):
             self.verify(self.android_prefix() + header + self.kernel())
+
+    def test_private_firmware_descriptor_length_hash_and_explicit_presence(self):
+        mac = bytes([2,0,0,0,0,1])
+        firmware = bytes((i * 13 + 7) & 255 for i in range(pack.WIFI_FIRMWARE_SIZE))
+        header = bytearray(pack.make_payload_header(4096, mac))
+        header[288:320] = pack.wifi_metadata(mac, len(firmware))
+        image = self.android_prefix() + header + self.kernel() + firmware
+        with self.assertRaisesRegex(ValueError, 'SHA-256'):
+            self.verify(image)  # Synthetic bytes are never a production input.
+        with patch.object(pack, 'WIFI_FIRMWARE_SHA256', hashlib.sha256(firmware).hexdigest()):
+            result = self.verify(image)
+            self.assertEqual(result['wifi_firmware_bytes'], len(firmware))
+            for bad in [image[:-4], image + bytes(4), image[:-1] + bytes([image[-1] ^ 1])]:
+                with self.assertRaises(ValueError):
+                    self.verify(bad)
+        with self.assertRaises(ValueError):
+            self.verify(self.android_prefix() + pack.make_payload_header(4096, mac) + self.kernel() + firmware)
+        for size in (1, pack.WIFI_FIRMWARE_SIZE - 1, pack.WIFI_FIRMWARE_SIZE + 4):
+            with self.assertRaises(ValueError):
+                pack.wifi_metadata(mac, size)
+        with self.assertRaises(ValueError):
+            pack.wifi_metadata(None, pack.WIFI_FIRMWARE_SIZE)
 
     def test_truncated_v2_seed_rejected(self):
         with self.assertRaisesRegex(ValueError, "truncated"):

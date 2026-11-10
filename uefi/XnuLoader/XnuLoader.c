@@ -274,7 +274,8 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     EFI_STATUS Status;
     EFI_FILE_PROTOCOL *Root = NULL;
     EFI_LOADED_IMAGE_PROTOCOL *Image;
-    VOID *Kernel = NULL, *MemoryMap = NULL;
+    VOID *Kernel = NULL, *MemoryMap = NULL, *WifiFirmware = NULL;
+    UINTN WifiFirmwareSize = 0;
     UINTN KernelSize = 0, Pages = 0, DtSize, MapSize, MapKey, DescSize, Attempt;
     UINT32 DescVersion;
     EFI_PHYSICAL_ADDRESS Allocation = 0, SecondaryAllocation = 0;
@@ -292,7 +293,7 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         Print(L"Unsupported CurrentEL: EL1 is required.\r\n");
         return EFI_UNSUPPORTED;
     }
-    Status = B2lLoadBootPayload(&Kernel, &KernelSize, Dt.random_seed, Dt.wifi_mac);
+    Status = B2lLoadBootPayload(&Kernel, &KernelSize, Dt.random_seed, Dt.wifi_mac, &WifiFirmware, &WifiFirmwareSize);
     if (!EFI_ERROR(Status)) {
         PayloadSeed = TRUE;
         Dt.has_wifi_mac = b2l_wifi_mac_valid(Dt.wifi_mac);
@@ -354,7 +355,18 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
        B2L_NC_HEADER+B2L_DT_SPACE+sizeof(*Args)+8192<=ArenaSize-(CachePhysical-Base))
         CacheSize=B2lStageNativeCache((VOID*)(UINTN)CachePhysical,B2L_NC_HEADER);
     if(CacheSize){Dt.native_cache_base=CachePhysical;Dt.native_cache_size=CacheSize;}
-    DtPhysical = ALIGN_VALUE(CachePhysical+CacheSize, 4096);
+    UINT64 WifiPhysical=ALIGN_VALUE(CachePhysical+CacheSize,4096);
+    if(WifiFirmwareSize){
+        if(WifiFirmwareSize!=B2L_WIFI_FIRMWARE_BYTES||WifiPhysical<Base||
+           WifiPhysical-Base>ArenaSize||WifiFirmwareSize+B2L_DT_SPACE+sizeof(*Args)+8192>ArenaSize-(WifiPhysical-Base)){
+            Status=EFI_BAD_BUFFER_SIZE;goto Fail;
+        }
+        CopyMem((VOID*)(UINTN)WifiPhysical,WifiFirmware,WifiFirmwareSize);
+        Dt.wifi_firmware_base=WifiPhysical;Dt.wifi_firmware_size=WifiFirmwareSize;
+        FreePool(WifiFirmware);WifiFirmware=NULL;
+        Print(L"B2L: staged private WiFi firmware, %u bytes; execution remains disabled\r\n",(UINT32)WifiFirmwareSize);
+    }
+    DtPhysical = ALIGN_VALUE(WifiPhysical+WifiFirmwareSize, 4096);
     B2lTouchHandoff(Dt.touch_status);
     Status=ClaimExtraRam(MemoryMap,&Dt);
     if(EFI_ERROR(Status)){Print(L"Cannot reserve additional RAM: %r\r\n",Status);goto Fail;}
@@ -385,7 +397,7 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "b2l_rtc_wait=0 b2l_boot_timing=1 b2l_console_quiet=1 "
                 "b2l_cache_interactive=1 b2l_ax_seed=1 b2l_dvfs=2 "
                 "b2l_dvfs_cl0=1950000 b2l_dvfs_cl1=2002000 b2l_dvfs_cl2=2080000 "
-                "b2l_wifi_diag=9 "
+                "b2l_wifi_diag=10 "
 #else
                 "rd=b2l-diagnostic b2l_root_rw=0 b2l_system_log=0 b2l_native_cache=0 "
 #endif
@@ -443,6 +455,7 @@ Fail:
     ZeroMem(Dt.random_seed, sizeof(Dt.random_seed));
     if (Root) Root->Close(Root);
     if (Kernel) FreePool(Kernel);
+    if (WifiFirmware) FreePool(WifiFirmware);
     if (MemoryMap) FreePool(MemoryMap);
     for(unsigned i=0;i<Dt.ram_count;i++)if(Dt.ram[i].base!=Allocation)gBS->FreePages(Dt.ram[i].base,EFI_SIZE_TO_PAGES(Dt.ram[i].size));
     if (Allocation) gBS->FreePages(Allocation, Pages);

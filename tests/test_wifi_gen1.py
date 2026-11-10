@@ -34,6 +34,7 @@ pre = r'''
 #include <stdarg.h>
 #include <string.h>
 #include "b2l_wifi_phy_data.h"
+#include "wifi_firmware_fixture.h"
 typedef uintptr_t vm_offset_t;
 typedef unsigned long vm_size_t;
 #define VM_WIMG_IO 0x66
@@ -56,6 +57,8 @@ static unsigned wrapper_reads[2], r4_cap_reads, core_fault;
 static uint32_t wrapper_values[2][3];
 static unsigned bank_reads, bank_writes, bank_index, tcm_fault;
 static uint32_t bank_info[13];
+static uint32_t firmware_ram[1297036/4];
+static unsigned fw_reads, fw_writes, fw_guards, fw_fault, fw_drop_word, fw_windows, fw_drop_window;
 static uint32_t original_viewport;
 static uint32_t original_endpoint_command, original_bar0;
 static uint64_t enabled_at;
@@ -73,7 +76,7 @@ static int PE_parse_boot_argn(const char *name, void *value, unsigned size) {
 }
 static uint64_t mach_absolute_time(void) { return now_us; }
 static void clock_interval_to_deadline(unsigned n, unsigned unit, uint64_t *at) {
-    assert((n == 500 || (mode >= 5 && n == 100)) && unit == NSEC_PER_MSEC); *at = now_us + n * 1000;
+    assert((n == 500 || (mode >= 5 && n == 100) || (mode == 10 && n == 5000)) && unit == NSEC_PER_MSEC); *at = now_us + n * 1000;
 }
 static void delay(unsigned us) { assert(us == 10 || us == 20 || us == 100); now_us += us; }
 static void delay_for_interval(unsigned n, unsigned unit) {
@@ -141,7 +144,9 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
             (mode >= 7 && memory[9][0x2080/4] == 0x18111000 && off < 0xe00) ||
             (mode >= 8 && (memory[9][0x2080/4] == 0x18102000 || memory[9][0x2080/4] == 0x18103000) &&
                 (off == 0x408 || off == 0x500 || off == 0x800)) ||
-            (mode == 9 && memory[9][0x2080/4] == 0x18002000 && (off == 0x40 || off == 0x44))));
+            (mode >= 9 && memory[9][0x2080/4] == 0x18002000 && (off == 0x40 || off == 0x44)) ||
+            (mode == 10 && memory[9][0x2080/4] >= 0x170000 &&
+             memory[9][0x2080/4] <= 0x2ac000 && off < 4096)));
     assert(allowed);
     if (i == 8 && (off == 0x0c || off == 0x18 || (off >= 0x900 && off <= 0x91c)))
         assert(mode >= 5 && trained && valid_link_setup());
@@ -155,13 +160,15 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
             (memory[9][0x2004/4] & 7) == 2) return 0;
         if (mode >= 7 && erom_fault == 4 && erom_reads && i == 4 && off == 0x74) return 0;
         if (mode >= 8 && core_fault == 7 && wrapper_reads[0] && i == 4 && off == 0x74) return 0;
-        if (mode == 9 && tcm_fault == 5 && bank_reads && i == 4 && off == 0x74) return 0;
+        if (mode >= 9 && tcm_fault == 5 && bank_reads && i == 4 && off == 0x74) return 0;
+        if (mode == 10 && fw_fault == 7 && fw_reads >= 16 && i == 4 && off == 0x74) return 0;
     }
     if (i == 9) {
         assert(!(mode >= 6 && chip_fault == 9 && (memory[9][0x2004/4] & 7) == 2));
         assert(!(mode >= 7 && erom_fault == 4 && erom_reads));
         assert(!(mode >= 8 && core_fault == 7 && wrapper_reads[0]));
-        assert(!(mode == 9 && tcm_fault == 5 && bank_reads));
+        assert(!(mode >= 9 && tcm_fault == 5 && bank_reads));
+        assert(!(mode == 10 && fw_fault == 7 && fw_reads >= 16));
         static const unsigned expected[] = { 0x2000, 0x2004, 0x2008, 0x202c };
         if (endpoint_reads < 4) assert(off == expected[endpoint_reads++]);
         else assert(mode >= 6 && (off == 0x2004 || off == 0x2010 || off == 0x2014 || off == 0x2080));
@@ -180,6 +187,27 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
         return memory[i][off/4];
     }
     if (i == 10) {
+        uint32_t window = memory[9][0x2080/4];
+        if (mode == 10 && window >= 0x170000 && window <= 0x2ac000) {
+            unsigned index = (window - 0x170000 + off)/4;
+            assert(off < 4096 && index < sizeof(firmware_ram)/4 && index == fw_reads);
+            assert(bank_reads == 13 && bank_index == 7 && fw_guards >= 2);
+            assert((memory[9][0x2004/4] & 7) == 2 && atu0[1] == 0x80000000);
+            fw_reads++;
+            return fw_fault == 5 && fw_reads == 5 ? firmware_ram[index] ^ 1 : firmware_ram[index];
+        }
+        if (mode == 10 && window == 0x18102000 && bank_reads == 13) {
+            static const unsigned expected[] = {0x408,0x800};
+            assert(off == expected[fw_guards % 2] && wrapper_reads[1] == 3);
+            fw_guards++;
+            if (off == 0x408 && fw_fault == 4) return UINT32_MAX;
+            if (fw_reads >= 1024) {
+                if (off == 0x408 && fw_fault == 1) return 0x20;
+                if (off == 0x408 && fw_fault == 2) return 1;
+                if (off == 0x800 && fw_fault == 3) return 1;
+            }
+            return wrapper_values[1][off == 0x408 ? 0 : 2];
+        }
         if (mode >= 8 && (memory[9][0x2080/4] == 0x18102000 || memory[9][0x2080/4] == 0x18103000)) {
             unsigned core = memory[9][0x2080/4] == 0x18103000 ? 0 : 1;
             static const unsigned expected[] = { 0x408, 0x500, 0x800 };
@@ -191,7 +219,7 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
             if (core_fault == 6) now_us += 110000;
             return value;
         }
-        if (mode == 9 && memory[9][0x2080/4] == 0x18002000 && (off == 0x40 || off == 0x44)) {
+        if (mode >= 9 && memory[9][0x2080/4] == 0x18002000 && (off == 0x40 || off == 0x44)) {
             assert(r4_cap_reads == 1 && (wrapper_values[1][0] & 0x23) == 0x21 && !(wrapper_values[1][2] & 1));
             assert((memory[9][0x2004/4] & 7) == 2 && atu0[1] == 0x80000000);
             if (off == 0x40) {
@@ -268,7 +296,19 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
     unsigned i = region_index(address); assert(!(off & 3) && off < 0x4000); powered(i);
     uint32_t before = memory[i][off/4], mask = 0;
     if (i == 10) {
-        assert(mode == 9 && off == 0x40 && value < 13);
+        uint32_t window = memory[9][0x2080/4];
+        if (mode == 10 && window >= 0x170000 && window <= 0x2ac000) {
+            unsigned index = (window - 0x170000 + off)/4;
+            assert(off < 4096 && index < sizeof(firmware_ram)/4 && index == fw_writes);
+            assert(bank_reads == 13 && bank_index == 7 && fw_guards >= 2);
+            assert((memory[9][0x2004/4] & 7) == 2 && atu0[1] == 0x80000000);
+            assert(!memcmp(firmware_fixture + index*4, &value, 4));
+            writes++; fw_writes++;
+            if (fw_fault == 6 && fw_writes == 1) now_us += 6000000;
+            if (fw_writes != fw_drop_word) firmware_ram[index] = value;
+            return;
+        }
+        assert(mode >= 9 && off == 0x40 && value < 13);
         assert(memory[9][0x2080/4] == 0x18002000 && (memory[9][0x2004/4] & 7) == 2);
         assert(r4_cap_reads == 1 && (wrapper_values[1][0] & 0x23) == 0x21 && !(wrapper_values[1][2] & 1));
         assert(atu[1] == 0x80000000 && atu0[1] == 0x80000000 && memory[8][0x900/4] == 1);
@@ -290,8 +330,16 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
         if (off == 0x2010) assert(value == 4 || value == 0x14400004);
         if (off == 0x2014) assert(value == 0);
         if (off == 0x2080) assert(value == 0x18000000 || value == 0x18001000 || (mode >= 7 && value == 0x18111000) ||
-            (mode >= 8 && (value == 0x18103000 || value == 0x18102000 || value == 0x18002000)));
+            (mode >= 8 && (value == 0x18103000 || value == 0x18102000 || value == 0x18002000)) ||
+            (mode == 10 && value >= 0x170000 && value <= 0x2ac000 && !(value & 4095)));
         writes++; config_writes++;
+        if (mode == 10 && bank_reads == 13 && off == 0x2080 &&
+            (value == 0x18102000 || (value >= 0x170000 && value <= 0x2ac000))) {
+            fw_windows++;
+            if (fw_windows == fw_drop_window) return;
+        }
+        if (mode == 10 && fw_fault == 8 && fw_reads && off == 0x2080 && value == 0x18001000) return;
+        if (mode == 10 && fw_fault == 9 && fw_reads == sizeof(firmware_ram)/4 && off == 0x2004 && !value) return;
         if (writes == drop_write) return;
         if (chip_fault == 6 && off == 0x2004 && !value && (before & 7) == 2) return;
         if (chip_fault == 7 && off == 0x2080 && value == 0x18001000) return;
@@ -393,7 +441,9 @@ static void reset(unsigned which, unsigned failure) {
     erom_reads = erom_fault = 0; memset(erom, 0, sizeof(erom));
     wrapper_reads[0] = wrapper_reads[1] = r4_cap_reads = core_fault = 0;
     bank_reads = bank_writes = tcm_fault = 0; bank_index = 7;
-    for (unsigned b = 0; b < 13; b++) bank_info[b] = b < 5 ? 0x203 : 0xf;
+    fw_reads = fw_writes = fw_guards = fw_fault = fw_drop_word = fw_windows = fw_drop_window = 0;
+    if (mode == 10) { firmware_fixture_setup(); memset(firmware_ram, 0, sizeof(firmware_ram)); }
+    for (unsigned b = 0; b < 13; b++) bank_info[b] = mode == 10 ? (b == 4 ? 0x88c07 : 0x108c0f) : b < 5 ? 0x203 : 0xf;
     memset(wrapper_values, 0, sizeof(wrapper_values)); wrapper_values[0][0] = 1; wrapper_values[1][0] = 0x21;
     erom[0] = 0x4bf80001; erom[1] = 0x39000201; erom[2] = 0x18000005;
     erom[3] = 0x4bf83c01; erom[4] = 0x42000201; erom[5] = 0x18001005; erom[6] = 0xf;
@@ -449,7 +499,7 @@ static void verify_quiet(void) {
     assert(strstr(logs, "power probe restore verified"));
     if (strstr(logs, "Gen1 probe begin:"))
         assert(!(memory[4][0xc/4] | memory[4][0x10/4] | memory[4][0x14/4]));
-    assert(unmaps == (mode >= 6 ? 11u : mode + 5) && now_us < 1000000 && link_polls <= 500);
+    assert(unmaps == (mode >= 6 ? 11u : mode + 5) && now_us < (mode == 10 ? 7000000u : 1000000u) && link_polls <= 500);
     if (mode >= 5) {
         uint32_t expected_control = endpoint_fault == 7 || endpoint_fault == 10 ? 0x80000000 : 0;
         if (endpoint_fault == 16) expected_control = UINT32_MAX;
@@ -460,7 +510,8 @@ static void verify_quiet(void) {
         assert(atu0[1] == (chip_fault == 8 || chip_fault == 10 ? 0x80000000u : 0));
         int erom_dirty_command = mode >= 7 && (erom_fault == 4 || erom_fault == 12);
         if (mode >= 8 && (core_fault == 7 || core_fault == 9)) erom_dirty_command = 1;
-        if (mode == 9 && tcm_fault == 5) erom_dirty_command = 1;
+        if (mode >= 9 && tcm_fault == 5) erom_dirty_command = 1;
+        if (mode == 10 && (fw_fault == 7 || fw_fault == 9)) erom_dirty_command = 1;
         assert(memory[9][0x2004/4] == (original_endpoint_command | (chip_fault == 6 || chip_fault == 9 || erom_dirty_command ? 2u : 0)));
         uint32_t expected_bar = chip_fault == 6 || chip_fault == 9 || erom_dirty_command ? 0x14400004u : chip_fault == 11 ? 0 : original_bar0;
         uint32_t expected_window = chip_fault == 6 || chip_fault == 7 || chip_fault == 9 ?
@@ -468,7 +519,10 @@ static void verify_quiet(void) {
         if (mode >= 7 && (erom_fault == 4 || erom_fault == 10 || erom_fault == 12)) expected_window = 0x18111000;
         if (mode >= 8 && core_fault == 7) expected_window = 0x18103000;
         if (mode >= 8 && (core_fault == 8 || core_fault == 9)) expected_window = 0x18002000;
-        if (mode == 9 && tcm_fault == 5) expected_window = 0x18002000;
+        if (mode >= 9 && tcm_fault == 5) expected_window = 0x18002000;
+        if (mode == 10 && fw_fault == 7) expected_window = 0x170000;
+        if (mode == 10 && fw_fault == 8) expected_window = 0x18102000;
+        if (mode == 10 && fw_fault == 9) expected_window = 0x2ac000;
         assert(memory[9][0x2010/4] == expected_bar && memory[9][0x2014/4] == (chip_fault == 12 ? 1u : 0));
         assert(memory[9][0x2080/4] == expected_window);
     }
@@ -731,6 +785,50 @@ int main(void) {
         assert(!bank_reads && !bank_writes && strstr(logs, "TCM inventory skipped:"));
     }
     puts("TCM inventory: halted measured R4, selector-only writes, bounded 13-bank sizing, both units and selector restoration/fault guards passed");
+    mode = 10;
+    for (unsigned fault = 1; fault <= 10; fault++) {
+        reset(8, 0); firmware_fault = fault; b2l_wifi_diag_start();
+        assert(!maps && !writes && strstr(logs,"firmware input absent/invalid; no MMIO access"));
+    }
+    reset(8, 0); b2l_wifi_diag_start(); verify_quiet();
+    assert(fw_writes == sizeof(firmware_ram)/4 && fw_reads == fw_writes);
+    assert(!memcmp(firmware_ram, firmware_fixture, sizeof(firmware_ram)));
+    assert(strstr(logs,"firmware download complete: bytes=1297036 readback=verified R4=halted"));
+    unsigned normal_windows = fw_windows;
+    for (unsigned fault = 1; fault <= 10; fault++) {
+        reset(8, 0); fw_fault=fault;
+        if (fault == 10) bank_info[1] ^= 0x8000; /* Same size, changed raw profile. */
+        b2l_wifi_diag_start(); verify_quiet();
+        assert((strstr(logs,"firmware download complete:") != NULL) == (fault == 8));
+        if (fault <= 3) assert(fw_reads==1024 && fw_writes==1024);
+        if (fault == 4 || fault == 10) assert(!fw_reads && !fw_writes);
+        if (fault == 5) assert(fw_reads==5 && fw_writes==16);
+        if (fault == 6) assert(!fw_reads && fw_writes==16);
+        if (fault == 7) assert(fw_reads==16 && fw_writes==16);
+        if (fault >= 7 && fault <= 9) {
+            assert(strstr(logs,"cleanup=FAILED") && strstr(logs,"power probe restore verified"));
+        } else assert(strstr(logs,"Gen1 quiesce verified"));
+    }
+    const unsigned lost_words[]={1,16,17,1024,1025,160000,sizeof(firmware_ram)/4};
+    for (unsigned i=0;i<sizeof(lost_words)/sizeof(lost_words[0]);i++) {
+        reset(8,0);fw_drop_word=lost_words[i];b2l_wifi_diag_start();verify_quiet();
+        assert(fw_reads==fw_drop_word && fw_writes >= fw_reads && fw_writes-fw_reads < 16);
+        assert(!strstr(logs,"firmware download complete:") && strstr(logs,"Gen1 quiesce verified"));
+    }
+    const unsigned lost_windows[]={1,2,3,317,634,normal_windows};
+    for (unsigned i=0;i<sizeof(lost_windows)/sizeof(lost_windows[0]);i++) {
+        reset(8,0);fw_drop_window=lost_windows[i];b2l_wifi_diag_start();verify_quiet();
+        assert(!strstr(logs,"firmware download complete:") && strstr(logs,"Gen1 quiesce verified"));
+    }
+    for (unsigned i=0;i<8;i++) {
+        reset(8,0);erom[witness_offsets[i]/4]^=0x1000;b2l_wifi_diag_start();verify_quiet();
+        assert(!fw_reads && !fw_writes && !bank_reads);
+    }
+    reset(8,0);wrapper_values[1][0]=1;b2l_wifi_diag_start();verify_quiet();
+    assert(!fw_reads && !fw_writes && !bank_reads);
+    reset(8,0);tcm_fault=9;b2l_wifi_diag_start();verify_quiet();
+    assert(!fw_reads && !fw_writes && !bank_reads);
+    puts("Firmware: authenticated reserved input, exact measured TCM scope, full synthetic image/readback, halted R4 per page, deadline/link/readback/lost-write and cleanup guards passed");
 }
 '''
 
@@ -740,6 +838,6 @@ with tempfile.TemporaryDirectory(prefix='b2l-wifi-gen1-') as temporary:
     path.write_text(pre + source + post)
     subprocess.run(shlex.split(os.environ.get('CC', 'cc')) + [
         '-std=c11', '-O1', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
-        '-fno-omit-frame-pointer', '-I', str(repo / 'xnu-overlay/osfmk/arm64'),
+        '-fno-omit-frame-pointer', '-I', str(repo / 'xnu-overlay/osfmk/arm64'), '-I', str(repo / 'tests'),
         str(path), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

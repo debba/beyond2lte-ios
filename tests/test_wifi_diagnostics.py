@@ -94,6 +94,7 @@ def test_kernel():
 #include <stdarg.h>
 #include <string.h>
 #include "b2l_wifi_phy_data.h"
+#include "wifi_firmware_fixture.h"
 typedef uintptr_t vm_offset_t;
 typedef unsigned long vm_size_t;
 #define VM_WIMG_IO 0x66
@@ -188,7 +189,7 @@ static void reset(int requested, unsigned fail) {
     memset(memory, 0, sizeof(memory)); memset(logs, 0, sizeof(logs));
 }
 int main(void) {
-    const int disabled[] = {-1, 0, 10, 11, -2};
+    const int disabled[] = {-1, 0, 11, 12, -2};
     for (unsigned i = 0; i < sizeof(disabled)/sizeof(disabled[0]); i++) {
         reset(disabled[i], 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !unmapped && strstr(logs, "disabled"));
@@ -288,7 +289,7 @@ int main(void) {
         compiler = shlex.split(os.environ.get('CC', 'cc'))
         subprocess.run(compiler + ['-std=c11', '-Wall', '-Wextra', '-Werror',
                                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
-                                   '-I', str(REPO / 'xnu-overlay/osfmk/arm64'),
+                                   '-I', str(REPO / 'xnu-overlay/osfmk/arm64'), '-I', str(REPO / 'tests'),
                                    str(path), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 

@@ -21,6 +21,8 @@
  * state, and reads R4 capabilities only when the vendor core-up test passes.
  * b2l_wifi_diag=9 also inventories TCM banks on the measured halted R4,
  * temporarily changing only BANKIDX and restoring its original value.
+ * b2l_wifi_diag=10 writes the pinned private firmware to measured TCM and
+ * reads every word back while R4 stays halted. No firmware execution.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -31,9 +33,44 @@
 #include <mach/mach_time.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
+#include <pexpert/arm64/boot.h>
+#include <libkern/libkern.h>
 #include <vm/pmap.h>
 
 #define wlog(...) b2l_early_trace("B2L WIFI: " __VA_ARGS__)
+#define WIFI_FIRMWARE_BYTES 1297036u
+static const uint8_t *wifi_firmware;
+extern void b2l_sha256(const void *, size_t, uint8_t[32]);
+
+static int
+wifi_firmware_input(void)
+{
+    static const uint8_t expected[32] = {
+        0x16,0x76,0xf4,0x6c,0xe5,0x6b,0x96,0xf5,0x8d,0xc7,0x0d,0xe0,0x8b,0xea,0xab,0x4a,
+        0xb3,0x36,0x2e,0xe6,0xdd,0x75,0x14,0x65,0xa8,0xd6,0xa0,0x02,0x3c,0x3c,0x54,0xad
+    };
+    DTEntry dt;
+    const void *prop;
+    unsigned n;
+    uint64_t range[2];
+    uint8_t digest[32];
+    const boot_args *args = (const boot_args *)PE_state.bootArgs;
+    wifi_firmware = NULL;
+    if (!args || SecureDTLookupEntry(NULL, "/chosen", &dt) != kSuccess ||
+        SecureDTGetProperty(dt, "b2l,wifi-firmware", &prop, &n) != kSuccess || n != sizeof(range)) return -1;
+    memcpy(range, prop, sizeof(range));
+    if (range[1] != WIFI_FIRMWARE_BYTES || (range[0] & 4095) ||
+        range[0] < args->physBase || range[0] > args->topOfKernelData ||
+        range[1] > args->topOfKernelData - range[0]) return -1;
+    const uint8_t *data = (const uint8_t *)ml_static_ptovirt(range[0]);
+    if (!data) return -1;
+    b2l_sha256(data, WIFI_FIRMWARE_BYTES, digest);
+    if (memcmp(digest, expected, sizeof(expected))) return -1;
+    wifi_firmware = data;
+    wlog("private firmware input verified: bytes=%u SHA-256 pinned; no filesystem access\n", WIFI_FIRMWARE_BYTES);
+    return 0;
+}
 
 struct wifi_region {
     vm_offset_t physical, mapped;
@@ -326,12 +363,14 @@ wifi_tcm_index(struct wifi_region *regions, uint32_t index, uint64_t deadline)
 }
 
 static int
-wifi_tcm_inventory(struct wifi_region *regions, int *restore_failed)
+wifi_tcm_inventory(struct wifi_region *regions, int *restore_failed, unsigned *measured_profile)
 {
     const struct wifi_region *bar = &regions[10];
     uint32_t original = 0, bytes = 0;
     unsigned read_banks = 0;
     int changed = 0, restored = 1, result = -1;
+    unsigned matches = 1;
+    *measured_profile = 0;
     uint64_t deadline;
     /* Only the measured capability word is admitted by the caller: 5 TCMA
      * and 8 TCMB banks. si_tcm_size selects BANKIDX then reads BANKINFO.
@@ -351,6 +390,7 @@ wifi_tcm_inventory(struct wifi_region *regions, int *restore_failed)
             !wifi_bar_ready(regions, 0x18002000, deadline)) goto out;
         uint32_t info = wifi_read(bar, 0x44);
         if (info == UINT32_MAX) goto out;
+        if (info != (bank == 4 ? 0x88c07u : 0x108c0fu)) matches = 0;
         uint32_t size = ((info & 0x7fu) + 1u) * ((info & 0x200u) ? 1024u : 8192u);
         bytes += size;
         read_banks++;
@@ -371,10 +411,66 @@ out:
         }
     }
     if (!restored) *restore_failed = -1;
+    if (!result && restored && matches && bytes == 0x190000) *measured_profile = 1;
     wlog("TCM inventory end: stage=%s banks=%u bytes=%u selector_restore=%s; no RAM/firmware\n",
         result ? "incomplete" : "complete", read_banks, bytes,
         changed ? (restored ? "verified" : "FAILED") : "unchanged");
     return result || !restored ? -1 : 0;
+}
+
+static int
+wifi_firmware_halted(struct wifi_region *regions, uint64_t deadline)
+{
+    if (wifi_backplane_window(regions, 0x18102000, deadline) ||
+        !wifi_bar_ready(regions, 0x18102000, deadline)) return 0;
+    uint32_t io = wifi_read(&regions[10], 0x408);
+    if (!wifi_bar_ready(regions, 0x18102000, deadline)) return 0;
+    uint32_t reset = wifi_read(&regions[10], 0x800);
+    return io != UINT32_MAX && reset != UINT32_MAX && (io & 0x23u) == 0x21u && !(reset & 1u);
+}
+
+static uint32_t
+wifi_firmware_word(unsigned at)
+{
+    return (uint32_t)wifi_firmware[at] | (uint32_t)wifi_firmware[at+1] << 8 |
+        (uint32_t)wifi_firmware[at+2] << 16 | (uint32_t)wifi_firmware[at+3] << 24;
+}
+
+static int
+wifi_firmware_download(struct wifi_region *regions)
+{
+    uint64_t deadline;
+    unsigned verified = 0;
+    /* DHD uses base0x170000 and TCM0x190000 on this exact measured profile.
+     * Only this pinned image is written. No reset vector at zero, NVRAM,
+     * RAM-size token, DMA, IRQ or CPUHALT release is programmed. */
+    clock_interval_to_deadline(5000, NSEC_PER_MSEC, &deadline);
+    wlog("firmware download begin: base=0x170000 bytes=%u; 5 s bound, R4 halted, DMA off\n", WIFI_FIRMWARE_BYTES);
+    for (unsigned page = 0; page < WIFI_FIRMWARE_BYTES; page += 4096) {
+        uint32_t window = 0x170000 + page;
+        unsigned length = WIFI_FIRMWARE_BYTES - page;
+        if (length > 4096) length = 4096;
+        if (!wifi_firmware_halted(regions, deadline) ||
+            wifi_backplane_window(regions, window, deadline)) goto stopped;
+        for (unsigned chunk = 0; chunk < length; chunk += 64) {
+            unsigned end = chunk + 64;
+            if (end > length) end = length;
+            if (!wifi_bar_ready(regions, window, deadline)) goto stopped;
+            for (unsigned off = chunk; off < end; off += 4)
+                wifi_write(&regions[10], off, wifi_firmware_word(page + off));
+            if (!wifi_bar_ready(regions, window, deadline)) goto stopped;
+            for (unsigned off = chunk; off < end; off += 4) {
+                if (wifi_read(&regions[10], off) != wifi_firmware_word(page + off)) goto stopped;
+                verified += 4;
+            }
+        }
+    }
+    if (!wifi_firmware_halted(regions, deadline)) goto stopped;
+    wlog("firmware download complete: bytes=%u readback=verified R4=halted; execution/NVRAM/DMA/IRQs disabled\n", verified);
+    return 0;
+stopped:
+    wlog("firmware download stopped: verified_bytes=%u; no further RAM writes or firmware execution\n", verified);
+    return -1;
 }
 
 static int
@@ -391,6 +487,7 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
     unsigned erom_words = 0, target_signature = 0;
     uint32_t r4_cap = 0;
     unsigned r4_halted = 0;
+    unsigned measured_tcm = 0;
     const char *stage = "initial-state";
     uint64_t deadline;
     clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
@@ -468,7 +565,7 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
             }
             stage = "core-snapshot";
             if (wifi_core_snapshot(regions, &r4_cap, &r4_halted)) goto out;
-            if (mode == 9) {
+            if (mode >= 9) {
                 stage = "tcm-prerequisites";
                 if (!r4_halted || r4_cap != 0x351585) {
                     wlog("TCM inventory skipped: measured halted-R4/capability prerequisites absent cap=%#x halted=%u\n",
@@ -476,7 +573,16 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
                     goto out;
                 }
                 stage = "tcm-inventory";
-                if (wifi_tcm_inventory(regions, &cleanup_failed)) goto out;
+                if (wifi_tcm_inventory(regions, &cleanup_failed, &measured_tcm)) goto out;
+                if (mode == 10) {
+                    stage = "firmware-prerequisites";
+                    if (!measured_tcm || !wifi_firmware) {
+                        wlog("firmware download skipped: measured TCM/input prerequisites absent\n");
+                        goto out;
+                    }
+                    stage = "firmware-download";
+                    if (wifi_firmware_download(regions)) goto out;
+                }
             }
         }
     }
@@ -868,8 +974,12 @@ b2l_wifi_diag_start(void)
     static const unsigned qch[] = { 0x3034, 0x3038, 0x303c, 0x3040, 0x3044 };
     unsigned count = 4;
 
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 9) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 10) {
         wlog("diagnostic disabled; no MMIO access\n");
+        return;
+    }
+    if (mode == 10 && wifi_firmware_input()) {
+        wlog("firmware input absent/invalid; no MMIO access\n");
         return;
     }
     if (mode == 3) count = 5;

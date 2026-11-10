@@ -24,6 +24,8 @@ MAGIC = b"B2LXNU02"
 PAYLOAD_VERSION = 2
 HEADER_SIZE = 320
 SEED_SIZE = 256
+WIFI_FIRMWARE_SIZE = 1297036
+WIFI_FIRMWARE_SHA256 = "1676f46ce56b96f58dc70de08beaab4ab3362ee6dd751465a8d6a0023c3c54ad"
 
 
 def align(value, alignment=PAGE):
@@ -46,20 +48,37 @@ def read_wifi_mac(path):
     return mac
 
 
-def wifi_metadata(mac=None):
+def wifi_metadata(mac=None, firmware_size=0):
     if mac is None:
+        if firmware_size:
+            raise ValueError("private firmware requires WiFi metadata")
         return bytes(32)
     if len(mac) != 6 or not any(mac) or mac[0] & 1:
         raise ValueError("WiFi metadata requires six nonzero unicast address octets")
-    return b"B2LWIFI1" + mac + bytes(18)
+    if firmware_size not in (0, WIFI_FIRMWARE_SIZE):
+        raise ValueError("unsupported private firmware length")
+    extension = b"B2LFW001" + struct.pack("<I", firmware_size) + bytes(6) if firmware_size else bytes(18)
+    return b"B2LWIFI1" + mac + extension
+
+
+def wifi_firmware_size(field):
+    extension = field[14:]
+    if extension == bytes(18):
+        return 0
+    if len(extension) != 18 or extension[:8] != b"B2LFW001" or any(extension[12:]):
+        raise ValueError("invalid private firmware descriptor")
+    size = struct.unpack_from("<I", extension, 8)[0]
+    if size != WIFI_FIRMWARE_SIZE:
+        raise ValueError("unsupported private firmware length")
+    return size
 
 
 def check_wifi_metadata(field):
     if field == bytes(32):
         return False
-    if len(field) != 32 or field[:8] != b"B2LWIFI1" or any(field[14:]):
+    if len(field) != 32 or field[:8] != b"B2LWIFI1":
         raise ValueError("invalid optional BOOT WiFi metadata")
-    wifi_metadata(field[8:14])
+    wifi_metadata(field[8:14], wifi_firmware_size(field))
     return True
 
 
@@ -144,16 +163,23 @@ def check_boot(path):
         raise ValueError("legacy BOOT trailer provides only 64 seed bytes; repackage v2 with 256 seed bytes")
     if (magic, payload_version, header_size, offset) != (MAGIC, PAYLOAD_VERSION, HEADER_SIZE, HEADER_SIZE):
         raise ValueError("invalid BOOT trailer header")
-    if size < 4096 or size > 128 * 1024 * 1024 or trailer + offset + size != len(data):
+    if size < 4096 or size > 128 * 1024 * 1024 or trailer + offset + size > len(data):
         raise ValueError("invalid BOOT trailer size")
     wifi_present = check_wifi_metadata(data[trailer + 288:trailer + 320])
+    firmware_size = wifi_firmware_size(data[trailer + 288:trailer + 320])
+    firmware_offset = trailer + offset + size
+    if firmware_offset + firmware_size != len(data):
+        raise ValueError("invalid BOOT trailer size")
+    if firmware_size and hashlib.sha256(data[firmware_offset:]).hexdigest() != WIFI_FIRMWARE_SHA256:
+        raise ValueError("private firmware SHA-256 mismatch")
     macho = trailer + offset
     if struct.unpack_from("<III", data, macho) != (0xfeedfacf, 0x0100000c, 0):
         raise ValueError("XNU must be a thin, plain ARM64 Mach-O image")
     return {"android_kernel_bytes": kernel_size, "trailer_file_offset": trailer,
             "xnu_bytes": size, "boot_bytes": len(data), "ramdisk_bytes": 0,
             "payload_version": PAYLOAD_VERSION, "seed_bytes": SEED_SIZE,
-            "wifi_mac_present": wifi_present}
+            "wifi_mac_present": wifi_present, "wifi_firmware_bytes": firmware_size,
+            "wifi_firmware_file_offset": firmware_offset if firmware_size else None}
 
 
 def main():

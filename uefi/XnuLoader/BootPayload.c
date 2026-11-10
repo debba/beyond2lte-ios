@@ -31,14 +31,17 @@ STATIC UINT64 Le64(CONST UINT8 *P) {
   return (UINT64)Le32(P) | (UINT64)Le32(P + 4) << 32;
 }
 
-EFI_STATUS B2lLoadBootPayload(VOID **Kernel, UINTN *KernelSize, UINT8 Seed[B2L_BOOT_SEED_SIZE], UINT8 WifiMac[6]) {
+EFI_STATUS B2lLoadBootPayload(VOID **Kernel, UINTN *KernelSize, UINT8 Seed[B2L_BOOT_SEED_SIZE], UINT8 WifiMac[6], VOID **WifiFirmware, UINTN *WifiFirmwareSize) {
   EFI_HANDLE *Handles = NULL;
   UINTN Count = 0;
   EFI_STATUS Status;
-  if (Kernel == NULL || KernelSize == NULL || Seed == NULL || WifiMac == NULL) return EFI_INVALID_PARAMETER;
+  if (Kernel == NULL || KernelSize == NULL || Seed == NULL || WifiMac == NULL ||
+      WifiFirmware == NULL || WifiFirmwareSize == NULL) return EFI_INVALID_PARAMETER;
   ZeroMem(WifiMac, B2L_WIFI_MAC_BYTES);
   *Kernel = NULL;
   *KernelSize = 0;
+  *WifiFirmware = NULL;
+  *WifiFirmwareSize = 0;
   mBootUfsLun = MAX_UINT32;
   Status = gBS->LocateHandleBuffer(ByProtocol, &gEfiBlockIoProtocolGuid, NULL, &Count, &Handles);
   if (EFI_ERROR(Status)) return Status;
@@ -90,6 +93,8 @@ EFI_STATUS B2lLoadBootPayload(VOID **Kernel, UINTN *KernelSize, UINT8 Seed[B2L_B
     // Decode only after recognizing and bounding our complete BOOT header.
     UINT8 CandidateMac[B2L_WIFI_MAC_BYTES];
     if (b2l_boot_wifi_decode(Payload + 32 + B2L_BOOT_SEED_SIZE, CandidateMac) < 0) break;
+    int FirmwareBytes = b2l_boot_wifi_firmware(Payload + 32 + B2L_BOOT_SEED_SIZE);
+    if (FirmwareBytes < 0 || (UINT64)FirmwareBytes > Capacity - Offset - KernelOffset - Length) break;
     Buffer = AllocatePool((UINTN)Length);
     if (Buffer == NULL) { Status = EFI_OUT_OF_RESOURCES; break; }
     ReadStatus = Disk->ReadDisk(Disk, MediaId, Offset + KernelOffset, (UINTN)Length, Buffer);
@@ -97,6 +102,14 @@ EFI_STATUS B2lLoadBootPayload(VOID **Kernel, UINTN *KernelSize, UINT8 Seed[B2L_B
     if (Le32(Buffer) != 0xfeedfacf || Le32((UINT8 *)Buffer + 4) != 0x0100000c) {
       FreePool(Buffer);
       break;
+    }
+    if (FirmwareBytes) {
+      VOID *Firmware = AllocatePool((UINTN)FirmwareBytes);
+      if (Firmware == NULL) { FreePool(Buffer); Status = EFI_OUT_OF_RESOURCES; break; }
+      ReadStatus = Disk->ReadDisk(Disk, MediaId, Offset + KernelOffset + Length, (UINTN)FirmwareBytes, Firmware);
+      if (EFI_ERROR(ReadStatus)) { FreePool(Firmware); FreePool(Buffer); Status = ReadStatus; break; }
+      *WifiFirmware = Firmware;
+      *WifiFirmwareSize = (UINTN)FirmwareBytes;
     }
     CopyMem(Seed, Payload + 32, B2L_BOOT_SEED_SIZE);
     CopyMem(WifiMac, CandidateMac, B2L_WIFI_MAC_BYTES);

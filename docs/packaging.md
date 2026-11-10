@@ -33,8 +33,19 @@ The trailer begins at `page_size + align(kernel_size, page_size)`. Page size is
 | 16 | 8 | Mach-O byte length |
 | 24 | 8 | Mach-O offset from header, 320 |
 | 32 | 256 | Host-generated random seed |
-| 288 | 32 | Reserved, zero |
+| 288 | 14 | Optional `B2LWIFI1` tag and six private address bytes |
+| 302 | 18 | Optional private Wi-Fi firmware descriptor, otherwise zero |
 | 320 | variable | Thin ARM64 Mach-O |
+
+Public artifacts leave the whole optional 32-byte field zero. A local private
+image may add `B2LFW001`, a 32-bit firmware length and six zero bytes at offset
+302, then append that firmware immediately after the Mach-O. Only the pinned
+1,297,036-byte original station image is accepted. The host verifier checks its
+SHA-256 and exact file end; stale bytes without the descriptor are never loaded.
+The loader reads the attachment into owned RAM below `top_of_kernel_data` and
+reports its physical range through `/chosen/b2l,wifi-firmware`. XNU validates
+the range and pinned SHA-256 before any Wi-Fi MMIO access. Firmware bytes and
+private address metadata are never CI inputs.
 
 XNU requires all 256 seed bytes. Packaging obtains those bytes directly from
 `os.urandom(256)`; it does not repeat or pad a shorter seed. The loader rejects

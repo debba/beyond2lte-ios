@@ -6,6 +6,7 @@
 #include "../uefi/XnuLoader/DeviceTree.h"
 static unsigned seed_properties, memory_map_nodes, defaults_nodes, ctrr_properties;
 static unsigned boot_lun_properties, secondary_properties;
+static unsigned wifi_firmware_properties;
 static unsigned development_security_properties, wifi_mac_properties, sleep_disabled_properties;
 static unsigned cpu_nodes, cpu_ids, product_nodes, manifest_nodes, target_type_properties;
 static uint64_t read64(const unsigned char*p){uint64_t v;memcpy(&v,p,8);return v;}
@@ -69,6 +70,11 @@ static size_t decode(const unsigned char *buf, size_t size, size_t off,
             ++development_security_properties;
         }
         if (!strcmp(name,"b2l,native-cache")){assert(len==16);assert(read64(buf+off)==0x902000000ULL);assert(read64(buf+off+8)==128*1024*1024);}
+        if (!strcmp(name,"b2l,wifi-firmware")){
+            ++wifi_firmware_properties;
+            assert(depth==1&&node_name&&!strcmp(node_name,"chosen"));
+            assert(len==16&&read64(buf+off)==0x910000000ULL&&read64(buf+off+8)==B2L_WIFI_FIRMWARE_BYTES);
+        }
         if (!strcmp(name,"b2l,secondary-trampoline")) {
             ++secondary_properties;
             assert(depth==1 && node_name && !strcmp(node_name,"chosen"));
@@ -151,6 +157,21 @@ int main(void)
     assert(development_security_properties==4);
     assert(cpu_nodes==8 && cpu_ids==0xff);
     assert(product_nodes==1 && manifest_nodes==1);
+    /* Firmware staging must remain inside the owned kernel arena. */
+    c.wifi_firmware_base=c.memory_base+256*1024*1024;c.wifi_firmware_size=B2L_WIFI_FIRMWARE_BYTES;
+    assert(b2l_build_device_tree(small,sizeof(small),&c,&used)==0);
+    nodes=props=0;
+    assert(decode(small,used,0,0,&nodes,&props,"")==used&&wifi_firmware_properties==1);
+    c.wifi_firmware_base++;
+    assert(b2l_build_device_tree(small,sizeof(small),&c,&used)==-1);
+    c.wifi_firmware_base=c.memory_base+c.memory_size-4096;
+    assert(b2l_build_device_tree(small,sizeof(small),&c,&used)==-1);
+    c.wifi_firmware_base=c.memory_base-4096;
+    assert(b2l_build_device_tree(small,sizeof(small),&c,&used)==-1);
+    c.wifi_firmware_base=c.memory_base;c.wifi_firmware_size--;
+    assert(b2l_build_device_tree(small,sizeof(small),&c,&used)==-1);
+    c.wifi_firmware_base=c.wifi_firmware_size=0;
+    assert(b2l_build_device_tree(buf,sizeof(buf),&c,&used)==0);
     for(size_t capacity=0;capacity<used;++capacity) {
         size_t ignored=0; memset(small,0x5a,sizeof(small));
         assert(b2l_build_device_tree(small,capacity,&c,&ignored)<0);

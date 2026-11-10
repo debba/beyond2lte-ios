@@ -63,6 +63,10 @@ int b2l_build_device_tree(void *buffer, b2l_size capacity,
     if ((c->secondary_base || c->secondary_size) &&
         (!b2l_secondary_address(c->secondary_base) || c->secondary_size!=B2L_SECONDARY_BYTES))return -1;
     if(c->ram_count&&b2l_ram_validate(c->ram,c->ram_count,c->memory_base,c->memory_size))return -1;
+    if((c->wifi_firmware_base||c->wifi_firmware_size)&&
+       (c->wifi_firmware_size!=B2L_WIFI_FIRMWARE_BYTES||(c->wifi_firmware_base&4095)||
+        c->wifi_firmware_base<c->memory_base||c->wifi_firmware_base-c->memory_base>c->memory_size||
+        c->wifi_firmware_size>c->memory_size-(c->wifi_firmware_base-c->memory_base)))return -1;
     mem_regs[0] = c->memory_base; mem_regs[1] = c->memory_size;
     root = begin(&w, 0, "device-tree");
     /* hw.product/hw.machine feed MobileGestalt ProductType and DeviceClass.
@@ -101,6 +105,10 @@ int b2l_build_device_tree(void *buffer, b2l_size capacity,
     if(c->native_cache_size){
         b2l_u64 cache_range[2]={c->native_cache_base,c->native_cache_size};
         prop(&w,&chosen,"b2l,native-cache",cache_range,sizeof(cache_range));
+    }
+    if(c->wifi_firmware_size){
+        b2l_u64 firmware_range[2]={c->wifi_firmware_base,c->wifi_firmware_size};
+        prop(&w,&chosen,"b2l,wifi-firmware",firmware_range,sizeof(firmware_range));
     }
     if(c->secondary_size){
         b2l_u64 range[2]={c->secondary_base,c->secondary_size};

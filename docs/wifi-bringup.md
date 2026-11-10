@@ -349,7 +349,7 @@ checkpoint. Bank count alone does not establish memory capacity or power state.
 
 ## TCM bank inventory
 
-The userspace loader now selects `b2l_wifi_diag=9`. It repeats all preceding
+`b2l_wifi_diag=9` repeats all preceding
 checks and additionally requires the exact measured capabilities `0x351585`
 and an active R4 with CPUHALT set. It never forces that state. Changed EROM,
 capabilities, clock/reset or CPUHALT prerequisites skip all selector access.
@@ -376,6 +376,35 @@ The original selector was zero. Banks 0 through 3 and 5 through 12 each report
 128 KiB; bank 4 reports 64 KiB. Total reported capacity is **1,638,400 bytes**
 (`0x190000`), matching the original Android DHD report at base `0x170000`.
 This establishes reported capacity, without testing RAM contents or power state.
+
+## Firmware copy with R4 halted
+
+The userspace loader now selects `b2l_wifi_diag=10`. A private BOOT attachment
+provides the original 1,297,036-byte `bcmdhd_sta.bin_b1`. Public CI artifacts
+contain no firmware. The loader copies the optional attachment into its owned
+arena before the device tree and boot arguments; `top_of_kernel_data` keeps it
+out of the free-page allocator. `/chosen/b2l,wifi-firmware` describes that range.
+The [BOOT packaging contract](packaging.md) defines the explicit descriptor.
+
+XNU requires the exact length, page-aligned range wholly inside reserved boot
+data and pinned SHA-256 before it maps any Wi-Fi registers. It repeats mode 9
+and requires every measured BANKINFO word, the exact `0x190000` total, verified
+selector restoration, and the preceding EROM/core prerequisites. The physical
+outcome of this firmware-copy checkpoint is pending.
+
+The copy uses only the existing first 4 KiB BAR0 route and switches its window
+over `[0x170000, 0x2aca8c)`. Before each page it checks R4 CLOCK_EN, FGC, RESET
+and CPUHALT through the measured wrapper. A single five-second deadline covers
+the transfer. Each bounded 64-byte burst has link/configuration/BAR/window
+guards before writes and before readback; every written word must compare
+equal to the authenticated source. It checks R4 halt again after the final
+readback. A guard, deadline or comparison failure stops further RAM writes.
+
+No CPUHALT release, core reset, reset vector at address zero, NVRAM, RAM-size
+token, DMA or IRQ setup is performed. The copied RAM is volatile and is not
+restored to its old contents; all normal BAR/window/ATU/PHY/power cleanup still
+runs. Copy/readback completion and cleanup are separate results. This step
+does not execute firmware or provide networking.
 
 ## Recovery evidence
 
@@ -404,12 +433,12 @@ Using temporary copies of those exact verified files in recovery, the original
 Linux driver successfully opened its interface, completed the ARM shared-memory
 handshake and loaded CLM. Firmware reported version `18.41.117`, build date
 2022-07-19, FWID `01-1b4772fd`. No scan, AP association or DHCP was requested.
-This validates the firmware pairing under Linux. Firmware loading, transport
+This validates the firmware pairing under Linux. Firmware execution, transport
 and networking under XNU remain unimplemented.
 
 ## Following checkpoints
 
-1. Implement bounded XNU firmware staging/download and verify readback with
+1. Validate bounded XNU firmware staging/download and full readback with
    R4 held halted, preserving the validated TCM-inventory BOOT as rollback.
 2. Bring up firmware execution and the shared command/ring protocol with an
    appropriate DMA/SysMMU and interrupt design.
@@ -485,6 +514,15 @@ all 13 banks, both size-unit encodings, changed capability/EROM witnesses,
 running/gated/reset R4, invalid original selector/BANKINFO, deadlines before
 and after a selector write, link loss, every lost write, and failed selector
 restoration with bounded retries and continued parent power restoration.
+
+Mode 10 tests a complete synthetic image in a backplane RAM model, exact
+address bounds, halt checks per page, altered raw bank profile, staging bounds
+and authentication failures, lost data/window writes at boundary positions,
+readback corruption, clock/reset/halt changes, deadline/link loss, and failed
+final cleanup. SHA authentication is mocked in the MMIO fixture; the actual
+SHA primitive has separate known-answer cache tests. No vendor image is in CI.
+The real EFI BOOT reader also runs against synthetic devices to check explicit
+attachment presence, partition bounds, read/allocation failures and cleanup.
 
 ## Source references
 
