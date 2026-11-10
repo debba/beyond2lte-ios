@@ -209,7 +209,7 @@ wifi_chipcommon_probe(struct wifi_region *regions)
     };
     static const unsigned offsets[] = { 0, 4, 0xfc };
     uint32_t words[3] = { 0 }, low = 0, high = 0, window = 0, command = 0;
-    int atu_owned = 0, ep_changed = 0, cleanup_failed = 0;
+    int atu_owned = 0, ep_changed = 0, cleanup_failed = 0, cfg_selected = 0;
     const char *stage = "initial-state";
     uint64_t deadline;
     clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
@@ -277,7 +277,7 @@ out:
     /* Disable memory decoding before restoring BARs. PCI status W1C bits are
      * written as zero; bus mastering was never enabled. If the link is lost,
      * do not issue more config requests; caller still asserts PERST/power off. */
-    int cfg_selected = !wifi_restore_bits(dbi, 0x900, UINT32_MAX, 1);
+    cfg_selected = !wifi_restore_bits(dbi, 0x900, UINT32_MAX, 1);
     if (!cfg_selected) cleanup_failed = -1;
     if (ep_changed) {
         int disabled = 0;
