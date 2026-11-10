@@ -188,7 +188,7 @@ static void reset(int requested, unsigned fail) {
     memset(memory, 0, sizeof(memory)); memset(logs, 0, sizeof(logs));
 }
 int main(void) {
-    const int disabled[] = {-1, 0, 8, 9, -2};
+    const int disabled[] = {-1, 0, 9, 10, -2};
     for (unsigned i = 0; i < sizeof(disabled)/sizeof(disabled[0]); i++) {
         reset(disabled[i], 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !unmapped && strstr(logs, "disabled"));

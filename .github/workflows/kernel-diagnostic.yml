@@ -83,6 +83,7 @@ jobs:
           python3 tests/test_acpm_diagnostics.py
           python3 tests/test_wifi_diagnostics.py
           python3 tests/test_wifi_gen1.py
+          python3 tests/test_wifi_erom.py
           python3 tests/test_fb_timing.py
           python3 tests/test-input-poll.py
           bash scripts/test-native-cache.sh

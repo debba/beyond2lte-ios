@@ -52,6 +52,8 @@ static uint32_t atu0[7];
 static unsigned chip_reads, chip_fault, config_writes;
 static unsigned erom_reads, erom_fault;
 static uint32_t erom[896];
+static unsigned wrapper_reads[2], r4_cap_reads, core_fault;
+static uint32_t wrapper_values[2][3];
 static uint32_t original_viewport;
 static uint32_t original_endpoint_command, original_bar0;
 static uint64_t enabled_at;
@@ -134,7 +136,9 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
         (mode >= 5 && i == 9 && (off == 0x2000 || off == 0x2004 || off == 0x2008 || off == 0x202c ||
             (mode >= 6 && (off == 0x2010 || off == 0x2014 || off == 0x2080)))) ||
         (mode >= 6 && i == 10 && (off == 0 || off == 4 || off == 0xfc ||
-            (mode == 7 && memory[9][0x2080/4] == 0x18111000 && off < 0xe00)));
+            (mode >= 7 && memory[9][0x2080/4] == 0x18111000 && off < 0xe00) ||
+            (mode == 8 && (memory[9][0x2080/4] == 0x18102000 || memory[9][0x2080/4] == 0x18103000) &&
+                (off == 0x408 || off == 0x500 || off == 0x800))));
     assert(allowed);
     if (i == 8 && (off == 0x0c || off == 0x18 || (off >= 0x900 && off <= 0x91c)))
         assert(mode >= 5 && trained && valid_link_setup());
@@ -146,11 +150,13 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
         if (i == 8 && off == 0x80 && endpoint_fault == 17) return 0x120000;
         if (mode >= 6 && chip_fault == 9 && i == 4 && off == 0x74 &&
             (memory[9][0x2004/4] & 7) == 2) return 0;
-        if (mode == 7 && erom_fault == 4 && erom_reads && i == 4 && off == 0x74) return 0;
+        if (mode >= 7 && erom_fault == 4 && erom_reads && i == 4 && off == 0x74) return 0;
+        if (mode == 8 && core_fault == 7 && wrapper_reads[0] && i == 4 && off == 0x74) return 0;
     }
     if (i == 9) {
         assert(!(mode >= 6 && chip_fault == 9 && (memory[9][0x2004/4] & 7) == 2));
-        assert(!(mode == 7 && erom_fault == 4 && erom_reads));
+        assert(!(mode >= 7 && erom_fault == 4 && erom_reads));
+        assert(!(mode == 8 && core_fault == 7 && wrapper_reads[0]));
         static const unsigned expected[] = { 0x2000, 0x2004, 0x2008, 0x202c };
         if (endpoint_reads < 4) assert(off == expected[endpoint_reads++]);
         else assert(mode >= 6 && (off == 0x2004 || off == 0x2010 || off == 0x2014 || off == 0x2080));
@@ -169,7 +175,24 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
         return memory[i][off/4];
     }
     if (i == 10) {
-        if (mode == 7 && memory[9][0x2080/4] == 0x18111000) {
+        if (mode == 8 && (memory[9][0x2080/4] == 0x18102000 || memory[9][0x2080/4] == 0x18103000)) {
+            unsigned core = memory[9][0x2080/4] == 0x18103000 ? 0 : 1;
+            static const unsigned expected[] = { 0x408, 0x500, 0x800 };
+            assert(chip_reads == 3 && erom_reads == 133 && wrapper_reads[core] < 3);
+            assert(off == expected[wrapper_reads[core]] && (memory[9][0x2004/4] & 7) == 2);
+            assert(memory[8][0x900/4] == 1 && atu[1] == 0x80000000 && atu0[1] == 0x80000000);
+            if (core == 1) assert(wrapper_reads[0] == 3);
+            uint32_t value = wrapper_values[core][wrapper_reads[core]++];
+            if (core_fault == 6) now_us += 110000;
+            return value;
+        }
+        if (mode == 8 && memory[9][0x2080/4] == 0x18002000) {
+            assert(off == 4 && wrapper_reads[0] == 3 && wrapper_reads[1] == 3 && !r4_cap_reads++);
+            assert((wrapper_values[1][0] & 3) == 1 && !(wrapper_values[1][2] & 1));
+            assert((memory[9][0x2004/4] & 7) == 2 && atu0[1] == 0x80000000);
+            return core_fault == 5 ? UINT32_MAX : 0x00450122;
+        }
+        if (mode >= 7 && memory[9][0x2080/4] == 0x18111000) {
             assert(chip_reads == 3 && off == erom_reads * 4 && off < 0xe00 && erom_reads < 896);
             assert((memory[9][0x2004/4] & 7) == 2 && memory[9][0x2010/4] == 0x14400004);
             assert(!memory[9][0x2014/4] && memory[8][0x900/4] == 1);
@@ -235,13 +258,16 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
         else assert(!(memory[9][0x2004/4] & 7)); /* Never move a live BAR. */
         if (off == 0x2010) assert(value == 4 || value == 0x14400004);
         if (off == 0x2014) assert(value == 0);
-        if (off == 0x2080) assert(value == 0x18000000 || value == 0x18001000 || (mode == 7 && value == 0x18111000));
+        if (off == 0x2080) assert(value == 0x18000000 || value == 0x18001000 || (mode >= 7 && value == 0x18111000) ||
+            (mode == 8 && (value == 0x18103000 || value == 0x18102000 || value == 0x18002000)));
         writes++; config_writes++;
         if (writes == drop_write) return;
         if (chip_fault == 6 && off == 0x2004 && !value && (before & 7) == 2) return;
         if (chip_fault == 7 && off == 0x2080 && value == 0x18001000) return;
-        if (mode == 7 && erom_fault == 10 && erom_reads && off == 0x2080 && value == 0x18001000) return;
-        if (mode == 7 && erom_fault == 12 && erom_reads && off == 0x2004 && !value) return;
+        if (mode >= 7 && erom_fault == 10 && erom_reads && off == 0x2080 && value == 0x18001000) return;
+        if (mode >= 7 && erom_fault == 12 && erom_reads && off == 0x2004 && !value) return;
+        if (mode == 8 && core_fault == 8 && r4_cap_reads && off == 0x2080 && value == 0x18001000) return;
+        if (mode == 8 && core_fault == 9 && r4_cap_reads && off == 0x2004 && !value) return;
         memory[i][off/4] = off == 0x2004 ? (before & 0xffff0000) | value : value;
         return;
     }
@@ -334,6 +360,8 @@ static void reset(unsigned which, unsigned failure) {
     enabled_at = 0; memset(atu, 0, sizeof(atu));
     memset(atu0, 0, sizeof(atu0)); chip_reads = chip_fault = config_writes = 0;
     erom_reads = erom_fault = 0; memset(erom, 0, sizeof(erom));
+    wrapper_reads[0] = wrapper_reads[1] = r4_cap_reads = core_fault = 0;
+    memset(wrapper_values, 0, sizeof(wrapper_values)); wrapper_values[0][0] = 1; wrapper_values[1][0] = 0x21;
     erom[0] = 0x4bf80001; erom[1] = 0x39000201; erom[2] = 0x18000005;
     erom[3] = 0x4bf83c01; erom[4] = 0x42000201; erom[5] = 0x18001005; erom[6] = 0xf;
     original_viewport = 0;
@@ -362,9 +390,17 @@ static void reset(unsigned which, unsigned failure) {
     memory[9][0x2010/4] = 4; memory[9][0x2080/4] = 0x18001000;
     memory[10][0] = 0x14834375; memory[10][1] = 0x48000000;
     memory[10][0xfc/4] = 0x18100000;
-    if (mode == 7) {
+    if (mode >= 7) {
         memory[10][0] = 0x10054375; memory[10][1] = 0x58400009;
         memory[10][0xfc/4] = 0x18111000;
+    }
+    if (mode == 8) {
+        /* Only the fixed target witnesses are relevant to this MMIO fixture;
+         * full table semantics are independently checked by test_wifi_erom.py. */
+        memset(erom, 0, sizeof(erom));
+        erom[0x44/4] = 0x4bf83e01; erom[0x48/4] = 0x0f084411; erom[0x50/4] = 0x18002005;
+        erom[0x68/4] = 0x181020c5; erom[0x70/4] = 0x4bf83c01; erom[0x74/4] = 0x40084411;
+        erom[0x7c/4] = 0x18003005; erom[0xa0/4] = 0x181030c5; erom[132] = 0xf;
     }
 }
 static void verify_quiet(void) {
@@ -389,12 +425,15 @@ static void verify_quiet(void) {
     }
     if (mode >= 6) {
         assert(atu0[1] == (chip_fault == 8 || chip_fault == 10 ? 0x80000000u : 0));
-        int erom_dirty_command = mode == 7 && (erom_fault == 4 || erom_fault == 12);
+        int erom_dirty_command = mode >= 7 && (erom_fault == 4 || erom_fault == 12);
+        if (mode == 8 && (core_fault == 7 || core_fault == 9)) erom_dirty_command = 1;
         assert(memory[9][0x2004/4] == (original_endpoint_command | (chip_fault == 6 || chip_fault == 9 || erom_dirty_command ? 2u : 0)));
         uint32_t expected_bar = chip_fault == 6 || chip_fault == 9 || erom_dirty_command ? 0x14400004u : chip_fault == 11 ? 0 : original_bar0;
         uint32_t expected_window = chip_fault == 6 || chip_fault == 7 || chip_fault == 9 ?
             0x18000000u : chip_fault == 13 ? UINT32_MAX : 0x18001000u;
-        if (mode == 7 && (erom_fault == 4 || erom_fault == 10 || erom_fault == 12)) expected_window = 0x18111000;
+        if (mode >= 7 && (erom_fault == 4 || erom_fault == 10 || erom_fault == 12)) expected_window = 0x18111000;
+        if (mode == 8 && core_fault == 7) expected_window = 0x18103000;
+        if (mode == 8 && (core_fault == 8 || core_fault == 9)) expected_window = 0x18002000;
         assert(memory[9][0x2010/4] == expected_bar && memory[9][0x2014/4] == (chip_fault == 12 ? 1u : 0));
         assert(memory[9][0x2080/4] == expected_window);
     }
@@ -579,6 +618,40 @@ int main(void) {
         assert(writes < erom_writes + 4000);
     }
     puts("EROM: measured page only, 896-word/deadline bounds, data extensions vs terminators, invalid data and cleanup faults passed");
+    mode = 8;
+    reset(8, 0); b2l_wifi_diag_start(); verify_quiet();
+    assert(wrapper_reads[0] == 3 && wrapper_reads[1] == 3 && r4_cap_reads == 1);
+    assert(strstr(logs, "core snapshot complete: wrappers=2 R4_capabilities=read"));
+    unsigned core_writes = writes;
+    for (unsigned failure = 1; failure <= core_writes; failure++) {
+        reset(8, 0); drop_write = failure; b2l_wifi_diag_start(); verify_quiet();
+        assert(wrapper_reads[0] <= 3 && wrapper_reads[1] <= 3 && r4_cap_reads <= 1);
+    }
+    for (unsigned fault = 1; fault <= 9; fault++) {
+        reset(8, 0); core_fault = fault;
+        if (fault == 1) wrapper_values[1][0] = 0;
+        if (fault == 2) wrapper_values[1][0] = 3;
+        if (fault == 3) wrapper_values[1][2] = 1;
+        if (fault == 4) wrapper_values[0][0] = UINT32_MAX;
+        b2l_wifi_diag_start(); verify_quiet();
+        if (fault <= 3) {
+            assert(!r4_cap_reads && strstr(logs, "core snapshot complete: wrappers=2 R4_capabilities=skipped"));
+        }
+        if (fault == 4 || fault == 6 || fault == 7) assert(wrapper_reads[0] == 1 && !wrapper_reads[1] && !r4_cap_reads);
+        if (fault >= 7) {
+            assert(strstr(logs, "cleanup=FAILED") && strstr(logs, "Gen1 quiesce FAILED"));
+            assert(strstr(logs, "power probe restore verified"));
+        } else assert(strstr(logs, "Gen1 quiesce verified"));
+    }
+    static const unsigned witness_offsets[] = { 0x44, 0x48, 0x50, 0x68, 0x70, 0x74, 0x7c, 0xa0 };
+    for (unsigned i = 0; i < 8; i++) {
+        reset(8, 0); erom[witness_offsets[i]/4] ^= 0x1000; b2l_wifi_diag_start(); verify_quiet();
+        assert(!wrapper_reads[0] && !wrapper_reads[1] && !r4_cap_reads);
+        assert(strstr(logs, "core snapshot skipped: measured EROM witnesses/count differ"));
+    }
+    reset(8, 0); erom[132] = 0; erom[133] = 0xf; b2l_wifi_diag_start(); verify_quiet();
+    assert(erom_reads == 134 && !wrapper_reads[0] && !strstr(logs, "core snapshot begin:"));
+    puts("Core state: measured EROM witnesses, fixed read-only wrappers, gated/reset R4 rejection and dropped-write/cleanup failures passed");
 }
 '''
 

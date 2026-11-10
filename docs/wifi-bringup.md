@@ -268,12 +268,15 @@ cleanup are separate results.
 
 ## Bounded EROM capture
 
-The userspace loader now selects `b2l_wifi_diag=7`. After repeating the verified
-chipcommon reads it accepts only the measured ID `0x10054375` and EROM pointer
+`b2l_wifi_diag=7` repeats the verified chipcommon reads and accepts only the
+measured ID `0x10054375` and EROM pointer
 `0x18111000`. With memory decoding off it switches `PCI_BAR0_WIN` to that
 page, verifies it, and re-enables memory decoding only. It uses the same first
 4 KiB BAR0 translation, with no additional CPU mapping or descriptor target.
-The physical outcome of this additional checkpoint is pending.
+This checkpoint completed on the phone: 133 contiguous words, exact completion
+count and terminator, followed by all cleanup checks and interactive Home.
+The full console had dropped records elsewhere; the EROM words themselves
+were complete and passed host structural validation.
 
 The raw capture has a 100 ms deadline and a limit of 896 aligned words, ending
 before EROM control offset `0xe00`. Before every read it checks the memory
@@ -292,6 +295,51 @@ Missing data, a deadline, a bound stop or malformed entries must not become
 an invented core map. Normal BAR0/window/ATU/PHY/power cleanup still runs, and
 its result is independent of capture completion. No core is reset, no chip
 register is written, and no RAM, DMA or firmware is used.
+
+Host decoding identified 20 components. Selected validated backplane targets:
+
+| Component | Revision | Register base | First master wrapper |
+| --- | --- | --- | --- |
+| Chipcommon | 64 | `0x18000000` | `0x18100000` |
+| ARM Cortex-R4 | 15 | `0x18002000` | `0x18102000` |
+| PCIe2 | 64 | `0x18003000` | `0x18103000` |
+| D11 MAC, instance 0 | 82 | `0x18001000` | `0x18101000` |
+| D11 MAC, instance 1 | 82 | `0x18004000` | `0x18104000` |
+
+These are chip backplane addresses, not host physical MMIO addresses. R4 slave
+port 1 describes apertures at `0x0`/`0x150000` and `0x170000`/`0x190000`
+(base/size). Aperture descriptors alone do not establish enabled RAM capacity.
+
+The host-only decoder checks raw offsets/count, identity pairs, master-port
+order, slave-port coverage, wrapper count/order/size, 64-bit extensions and
+range overflow. It makes no device access:
+
+```sh
+rtk proxy python3 scripts/decode-b2l-erom.py /private/path/epoch-console.txt
+```
+
+## Read-only core state
+
+The userspace loader now selects `b2l_wifi_diag=8`. It repeats the capture and
+requires 133 words plus eight exact measured CIA/CIB/register-base/wrapper
+witnesses for the two fixed targets. This is an additional guard for the
+already validated targets, not a replacement for the host table decoder.
+Any changed witness/count skips all following component access. The physical
+outcome of this additional checkpoint is pending.
+
+The probe switches the existing BAR0 window, with memory decoding off during
+each switch, to PCIe2 wrapper `0x18103000` and R4 wrapper `0x18102000`. It reads
+only IOCTRL `0x408`, IOSTATUS `0x500` and RESETCTRL `0x800` in each. A 100 ms
+deadline and the existing BAR/link/configuration guards apply to every word.
+It never writes a wrapper register, resets a core or changes its clock.
+
+Broadcom's `ai_iscoreup` requires IOCTRL CLOCK_EN set and FGC clear (low two
+bits equal 1), with RESETCTRL bit zero clear. Only when R4 satisfies those
+checks does the probe select R4 register page `0x18002000` and read capabilities
+at `0x04`. Otherwise it logs a skipped capability read. CPUHALT is reported
+from IOCTRL bit 5 and is never modified. A successful state snapshot does not
+mean the core is ready for firmware or that RAM banks have been sized.
+All existing BAR/window/ATU/PHY/power cleanup still runs on success or error.
 
 ## Recovery evidence
 
@@ -317,9 +365,10 @@ open; no random variant is used.
 
 ## Following checkpoints
 
-1. Capture and validate the EROM component table and all cleanup, preserving
-   the validated chipcommon-identity BOOT as rollback.
-2. Use validated core identities, select verified board firmware/NVRAM,
+1. Validate the read-only wrapper/core-state snapshot and all cleanup,
+   preserving the validated EROM BOOT as rollback.
+2. Establish a controlled firmware-download core state and enabled RAM banks,
+   select verified board firmware/NVRAM,
    and bring up firmware with an appropriate DMA/SysMMU design.
 3. Establish scanning, authentication, packet transport and DHCP, then adapt
    the HakiOS network and Apple80211 interfaces to this iOS release.
@@ -378,6 +427,16 @@ extension data. It covers invalid data, changed chip/pointer prerequisites,
 loss of link, missing/final-bound terminators, every dropped write in the new
 path, and failed final window/command cleanup with common power restoration.
 
+`rtk proxy python3 tests/test_wifi_erom.py` independently tests host decoding
+with synthetic 32/64-bit descriptors, extension words equal to terminators,
+duplicate core instances, zero-based memory, malformed/missing captures,
+port/wrapper mismatches and overflowing ranges.
+
+Mode 8 additionally tests all eight target witnesses and the exact count,
+fixed wrapper read scope, gated/forced-clock/reset R4 capability rejection,
+invalid state/capability words, deadline/link loss, every dropped write in the
+new path, and failed final cleanup. The backend permits no component writes.
+
 ## Source references
 
 Samsung/LineageOS is pinned to
@@ -397,6 +456,7 @@ Samsung/LineageOS is pinned to
 - [Broadcom PCIe chip-ID reader](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_pcie.c)
 - [AI EROM format and control-register boundary](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/aidmp.h)
 - [Broadcom AI EROM scan](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/aiutils.c)
+- [ARM R4 register layout](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/sbhndarm.h)
 - [Clock register bases, offsets and fields](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/soc/samsung/cal-if/exynos9820/cmucal-sfr.c)
 - [WLAN power and PCIe channel setup](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_custom_exynos.c)
 

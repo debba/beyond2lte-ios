@@ -17,6 +17,8 @@
  * maps dongle RAM, writes chip registers or loads firmware.
  * b2l_wifi_diag=7 also captures the measured AI EROM page, without following
  * its address descriptors or reading its control registers.
+ * b2l_wifi_diag=8 checks measured EROM witnesses, reads fixed R4/PCIe wrapper
+ * state, and reads R4 capabilities only when the vendor core-up test passes.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -215,12 +217,20 @@ wifi_bar_ready(struct wifi_region *regions, uint32_t window, uint64_t deadline)
 }
 
 static int
-wifi_erom_capture(struct wifi_region *regions)
+wifi_erom_capture(struct wifi_region *regions, unsigned *captured_words, unsigned *target_signature)
 {
     /* aidmp.h puts ER_REMAPCONTROL at 0xe00. Never read it or later registers.
      * An exact ER_END|ER_VALID (0xf) terminates only at a tagged-entry boundary;
      * 64-bit address/size extensions are untagged data and may also equal 0xf. */
     unsigned state = 0, size_follows = 0;
+    /* Host-validated epoch58 witnesses for just the two fixed probe targets.
+     * This is an additional device guard, not a general EROM decoder. */
+    static const struct { unsigned off; uint32_t value; } witnesses[] = {
+        { 0x44, 0x4bf83e01 }, { 0x48, 0x0f084411 }, { 0x50, 0x18002005 },
+        { 0x68, 0x181020c5 }, { 0x70, 0x4bf83c01 }, { 0x74, 0x40084411 },
+        { 0x7c, 0x18003005 }, { 0xa0, 0x181030c5 },
+    };
+    *captured_words = *target_signature = 0;
     uint64_t deadline;
     clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
     wlog("EROM capture begin: measured page=0x18111000, max=896 words, 100 ms; descriptors not followed\n");
@@ -230,10 +240,15 @@ wifi_erom_capture(struct wifi_region *regions)
             return -1;
         }
         uint32_t word = wifi_read(&regions[10], i * 4);
+        *captured_words = i + 1;
         wlog("EROM +%#x raw=%#x\n", i * 4, word);
         if (word == UINT32_MAX) {
             wlog("EROM capture stopped: invalid all-ones word=%u\n", i);
             return -1;
+        }
+        for (unsigned n = 0; n < sizeof(witnesses) / sizeof(witnesses[0]); n++) {
+            if (i * 4 == witnesses[n].off && word == witnesses[n].value)
+                *target_signature |= 1u << n;
         }
         if (state == 0) {
             if (word == 0x0f) {
@@ -254,6 +269,49 @@ wifi_erom_capture(struct wifi_region *regions)
 }
 
 static int
+wifi_backplane_window(struct wifi_region *regions, uint32_t window, uint64_t deadline)
+{
+    return wifi_ep_memory_command(regions, 0, deadline) ||
+        wifi_cfg_write_checked(regions, 0x80, window, deadline) ||
+        wifi_ep_memory_command(regions, 2, deadline) ? -1 : 0;
+}
+
+static int
+wifi_core_snapshot(struct wifi_region *regions)
+{
+    const struct wifi_region *bar = &regions[10];
+    static const uint32_t wrappers[] = { 0x18103000, 0x18102000 };
+    static const unsigned offsets[] = { 0x408, 0x500, 0x800 };
+    uint32_t values[2][3] = { { 0 } };
+    uint64_t deadline;
+    clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+    wlog("core snapshot begin: measured PCIe2/R4 wrappers; no core clock/reset writes\n");
+    for (unsigned core = 0; core < 2; core++) {
+        if (wifi_backplane_window(regions, wrappers[core], deadline)) return -1;
+        for (unsigned i = 0; i < 3; i++) {
+            if (!wifi_bar_ready(regions, wrappers[core], deadline)) return -1;
+            values[core][i] = wifi_read(bar, offsets[i]);
+            wlog("core wrapper=%#x +%#x raw=%#x\n", wrappers[core], offsets[i], values[core][i]);
+            if (values[core][i] == UINT32_MAX) return -1;
+        }
+    }
+    /* Broadcom ai_iscoreup: CLOCK_EN set, FGC clear, RESET clear. The R4
+     * CPUHALT flag is reported only, never modified in this checkpoint. */
+    unsigned r4_up = (values[1][0] & 3u) == 1 && !(values[1][2] & 1u);
+    wlog("R4 state: up=%u CPUHALT=%u; no clock/reset changes\n", r4_up, (values[1][0] >> 5) & 1u);
+    if (r4_up) {
+        if (wifi_backplane_window(regions, 0x18002000, deadline) ||
+            !wifi_bar_ready(regions, 0x18002000, deadline)) return -1;
+        uint32_t cap = wifi_read(bar, 4); /* sbhndarm.h: corecapabilities. */
+        wlog("R4 core capabilities=%#x; bank indices and RAM untouched\n", cap);
+        if (cap == UINT32_MAX) return -1;
+    } else wlog("R4 capabilities skipped: core-up prerequisites absent\n");
+    wlog("core snapshot complete: wrappers=2 R4_capabilities=%s; no chip writes or firmware\n",
+        r4_up ? "read" : "skipped");
+    return 0;
+}
+
+static int
 wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
 {
     const struct wifi_region *dbi = &regions[8], *cfg = &regions[9], *bar = &regions[10];
@@ -264,6 +322,7 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
     static const unsigned offsets[] = { 0, 4, 0xfc };
     uint32_t words[3] = { 0 }, low = 0, high = 0, window = 0, command = 0;
     int atu_owned = 0, ep_changed = 0, cleanup_failed = 0, cfg_selected = 0;
+    unsigned erom_words = 0, target_signature = 0;
     const char *stage = "initial-state";
     uint64_t deadline;
     clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
@@ -320,7 +379,7 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
     wlog("chipcommon identity verified: chip=%#x revision=%u package=%u interconnect=%u; EROM=%#x not followed\n",
         words[0] & 0xffffu, (words[0] >> 16) & 15u, (words[0] >> 20) & 15u,
         words[0] >> 28, words[2]);
-    if (mode == 7) {
+    if (mode >= 7) {
         stage = "erom-prerequisites";
         if (words[0] != 0x10054375 || words[2] != 0x18111000) {
             wlog("EROM capture skipped: chip identity/pointer differs from measured baseline\n");
@@ -331,7 +390,17 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
             wifi_cfg_write_checked(regions, 0x80, 0x18111000, deadline) ||
             wifi_ep_memory_command(regions, 2, deadline)) goto out;
         stage = "erom-capture";
-        if (wifi_erom_capture(regions)) goto out;
+        if (wifi_erom_capture(regions, &erom_words, &target_signature)) goto out;
+        if (mode == 8) {
+            stage = "core-prerequisites";
+            if (erom_words != 133 || target_signature != 0xff) {
+                wlog("core snapshot skipped: measured EROM witnesses/count differ words=%u signature=%#x\n",
+                    erom_words, target_signature);
+                goto out;
+            }
+            stage = "core-snapshot";
+            if (wifi_core_snapshot(regions)) goto out;
+        }
     }
     stage = "complete";
 out:
@@ -721,7 +790,7 @@ b2l_wifi_diag_start(void)
     static const unsigned qch[] = { 0x3034, 0x3038, 0x303c, 0x3040, 0x3044 };
     unsigned count = 4;
 
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 7) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 8) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }
