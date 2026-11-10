@@ -54,6 +54,8 @@ static unsigned erom_reads, erom_fault;
 static uint32_t erom[896];
 static unsigned wrapper_reads[2], r4_cap_reads, core_fault;
 static uint32_t wrapper_values[2][3];
+static unsigned bank_reads, bank_writes, bank_index, tcm_fault;
+static uint32_t bank_info[13];
 static uint32_t original_viewport;
 static uint32_t original_endpoint_command, original_bar0;
 static uint64_t enabled_at;
@@ -137,8 +139,9 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
             (mode >= 6 && (off == 0x2010 || off == 0x2014 || off == 0x2080)))) ||
         (mode >= 6 && i == 10 && (off == 0 || off == 4 || off == 0xfc ||
             (mode >= 7 && memory[9][0x2080/4] == 0x18111000 && off < 0xe00) ||
-            (mode == 8 && (memory[9][0x2080/4] == 0x18102000 || memory[9][0x2080/4] == 0x18103000) &&
-                (off == 0x408 || off == 0x500 || off == 0x800))));
+            (mode >= 8 && (memory[9][0x2080/4] == 0x18102000 || memory[9][0x2080/4] == 0x18103000) &&
+                (off == 0x408 || off == 0x500 || off == 0x800)) ||
+            (mode == 9 && memory[9][0x2080/4] == 0x18002000 && (off == 0x40 || off == 0x44))));
     assert(allowed);
     if (i == 8 && (off == 0x0c || off == 0x18 || (off >= 0x900 && off <= 0x91c)))
         assert(mode >= 5 && trained && valid_link_setup());
@@ -151,12 +154,14 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
         if (mode >= 6 && chip_fault == 9 && i == 4 && off == 0x74 &&
             (memory[9][0x2004/4] & 7) == 2) return 0;
         if (mode >= 7 && erom_fault == 4 && erom_reads && i == 4 && off == 0x74) return 0;
-        if (mode == 8 && core_fault == 7 && wrapper_reads[0] && i == 4 && off == 0x74) return 0;
+        if (mode >= 8 && core_fault == 7 && wrapper_reads[0] && i == 4 && off == 0x74) return 0;
+        if (mode == 9 && tcm_fault == 5 && bank_reads && i == 4 && off == 0x74) return 0;
     }
     if (i == 9) {
         assert(!(mode >= 6 && chip_fault == 9 && (memory[9][0x2004/4] & 7) == 2));
         assert(!(mode >= 7 && erom_fault == 4 && erom_reads));
-        assert(!(mode == 8 && core_fault == 7 && wrapper_reads[0]));
+        assert(!(mode >= 8 && core_fault == 7 && wrapper_reads[0]));
+        assert(!(mode == 9 && tcm_fault == 5 && bank_reads));
         static const unsigned expected[] = { 0x2000, 0x2004, 0x2008, 0x202c };
         if (endpoint_reads < 4) assert(off == expected[endpoint_reads++]);
         else assert(mode >= 6 && (off == 0x2004 || off == 0x2010 || off == 0x2014 || off == 0x2080));
@@ -175,7 +180,7 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
         return memory[i][off/4];
     }
     if (i == 10) {
-        if (mode == 8 && (memory[9][0x2080/4] == 0x18102000 || memory[9][0x2080/4] == 0x18103000)) {
+        if (mode >= 8 && (memory[9][0x2080/4] == 0x18102000 || memory[9][0x2080/4] == 0x18103000)) {
             unsigned core = memory[9][0x2080/4] == 0x18103000 ? 0 : 1;
             static const unsigned expected[] = { 0x408, 0x500, 0x800 };
             assert(chip_reads == 3 && erom_reads == 133 && wrapper_reads[core] < 3);
@@ -186,11 +191,25 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
             if (core_fault == 6) now_us += 110000;
             return value;
         }
-        if (mode == 8 && memory[9][0x2080/4] == 0x18002000) {
+        if (mode == 9 && memory[9][0x2080/4] == 0x18002000 && (off == 0x40 || off == 0x44)) {
+            assert(r4_cap_reads == 1 && (wrapper_values[1][0] & 0x23) == 0x21 && !(wrapper_values[1][2] & 1));
+            assert((memory[9][0x2004/4] & 7) == 2 && atu0[1] == 0x80000000);
+            if (off == 0x40) {
+                if (tcm_fault == 1 && !bank_writes) return UINT32_MAX;
+                if (tcm_fault == 8 && !bank_writes) return 13;
+                if (tcm_fault == 7 && bank_writes == 1) return bank_index ^ 1;
+                return bank_index;
+            }
+            assert(bank_reads < 13 && bank_index == bank_reads && bank_writes);
+            uint32_t info = bank_info[bank_reads++];
+            if (tcm_fault == 4) now_us += 110000;
+            return (tcm_fault == 2 && bank_reads == 1) || (tcm_fault == 3 && bank_reads == 6) ? UINT32_MAX : info;
+        }
+        if (mode >= 8 && memory[9][0x2080/4] == 0x18002000) {
             assert(off == 4 && wrapper_reads[0] == 3 && wrapper_reads[1] == 3 && !r4_cap_reads++);
             assert((wrapper_values[1][0] & 3) == 1 && !(wrapper_values[1][2] & 1));
             assert((memory[9][0x2004/4] & 7) == 2 && atu0[1] == 0x80000000);
-            return core_fault == 5 ? UINT32_MAX : 0x00450122;
+            return core_fault == 5 ? UINT32_MAX : tcm_fault == 9 ? 0x351584 : 0x351585;
         }
         if (mode >= 7 && memory[9][0x2080/4] == 0x18111000) {
             assert(chip_reads == 3 && off == erom_reads * 4 && off < 0xe00 && erom_reads < 896);
@@ -248,6 +267,18 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
 static void host_write(uintptr_t address, unsigned off, uint32_t value) {
     unsigned i = region_index(address); assert(!(off & 3) && off < 0x4000); powered(i);
     uint32_t before = memory[i][off/4], mask = 0;
+    if (i == 10) {
+        assert(mode == 9 && off == 0x40 && value < 13);
+        assert(memory[9][0x2080/4] == 0x18002000 && (memory[9][0x2004/4] & 7) == 2);
+        assert(r4_cap_reads == 1 && (wrapper_values[1][0] & 0x23) == 0x21 && !(wrapper_values[1][2] & 1));
+        assert(atu[1] == 0x80000000 && atu0[1] == 0x80000000 && memory[8][0x900/4] == 1);
+        assert(!(tcm_fault == 5 && bank_reads));
+        writes++; bank_writes++;
+        if (writes == drop_write || (tcm_fault == 6 && bank_reads == 13 && value == 7)) return;
+        bank_index = value;
+        if (tcm_fault == 11 && bank_writes == 1) now_us += 110000;
+        return;
+    }
     if (i == 9) {
         assert(mode >= 6 && endpoint_reads == 4 && memory[8][0x900/4] == 1 && atu[1] == 0x80000000);
         assert(off == 0x2004 || off == 0x2010 || off == 0x2014 || off == 0x2080);
@@ -259,15 +290,15 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
         if (off == 0x2010) assert(value == 4 || value == 0x14400004);
         if (off == 0x2014) assert(value == 0);
         if (off == 0x2080) assert(value == 0x18000000 || value == 0x18001000 || (mode >= 7 && value == 0x18111000) ||
-            (mode == 8 && (value == 0x18103000 || value == 0x18102000 || value == 0x18002000)));
+            (mode >= 8 && (value == 0x18103000 || value == 0x18102000 || value == 0x18002000)));
         writes++; config_writes++;
         if (writes == drop_write) return;
         if (chip_fault == 6 && off == 0x2004 && !value && (before & 7) == 2) return;
         if (chip_fault == 7 && off == 0x2080 && value == 0x18001000) return;
         if (mode >= 7 && erom_fault == 10 && erom_reads && off == 0x2080 && value == 0x18001000) return;
         if (mode >= 7 && erom_fault == 12 && erom_reads && off == 0x2004 && !value) return;
-        if (mode == 8 && core_fault == 8 && r4_cap_reads && off == 0x2080 && value == 0x18001000) return;
-        if (mode == 8 && core_fault == 9 && r4_cap_reads && off == 0x2004 && !value) return;
+        if (mode >= 8 && core_fault == 8 && r4_cap_reads && off == 0x2080 && value == 0x18001000) return;
+        if (mode >= 8 && core_fault == 9 && r4_cap_reads && off == 0x2004 && !value) return;
         memory[i][off/4] = off == 0x2004 ? (before & 0xffff0000) | value : value;
         return;
     }
@@ -361,6 +392,8 @@ static void reset(unsigned which, unsigned failure) {
     memset(atu0, 0, sizeof(atu0)); chip_reads = chip_fault = config_writes = 0;
     erom_reads = erom_fault = 0; memset(erom, 0, sizeof(erom));
     wrapper_reads[0] = wrapper_reads[1] = r4_cap_reads = core_fault = 0;
+    bank_reads = bank_writes = tcm_fault = 0; bank_index = 7;
+    for (unsigned b = 0; b < 13; b++) bank_info[b] = b < 5 ? 0x203 : 0xf;
     memset(wrapper_values, 0, sizeof(wrapper_values)); wrapper_values[0][0] = 1; wrapper_values[1][0] = 0x21;
     erom[0] = 0x4bf80001; erom[1] = 0x39000201; erom[2] = 0x18000005;
     erom[3] = 0x4bf83c01; erom[4] = 0x42000201; erom[5] = 0x18001005; erom[6] = 0xf;
@@ -394,7 +427,7 @@ static void reset(unsigned which, unsigned failure) {
         memory[10][0] = 0x10054375; memory[10][1] = 0x58400009;
         memory[10][0xfc/4] = 0x18111000;
     }
-    if (mode == 8) {
+    if (mode >= 8) {
         /* Only the fixed target witnesses are relevant to this MMIO fixture;
          * full table semantics are independently checked by test_wifi_erom.py. */
         memset(erom, 0, sizeof(erom));
@@ -426,14 +459,16 @@ static void verify_quiet(void) {
     if (mode >= 6) {
         assert(atu0[1] == (chip_fault == 8 || chip_fault == 10 ? 0x80000000u : 0));
         int erom_dirty_command = mode >= 7 && (erom_fault == 4 || erom_fault == 12);
-        if (mode == 8 && (core_fault == 7 || core_fault == 9)) erom_dirty_command = 1;
+        if (mode >= 8 && (core_fault == 7 || core_fault == 9)) erom_dirty_command = 1;
+        if (mode == 9 && tcm_fault == 5) erom_dirty_command = 1;
         assert(memory[9][0x2004/4] == (original_endpoint_command | (chip_fault == 6 || chip_fault == 9 || erom_dirty_command ? 2u : 0)));
         uint32_t expected_bar = chip_fault == 6 || chip_fault == 9 || erom_dirty_command ? 0x14400004u : chip_fault == 11 ? 0 : original_bar0;
         uint32_t expected_window = chip_fault == 6 || chip_fault == 7 || chip_fault == 9 ?
             0x18000000u : chip_fault == 13 ? UINT32_MAX : 0x18001000u;
         if (mode >= 7 && (erom_fault == 4 || erom_fault == 10 || erom_fault == 12)) expected_window = 0x18111000;
-        if (mode == 8 && core_fault == 7) expected_window = 0x18103000;
-        if (mode == 8 && (core_fault == 8 || core_fault == 9)) expected_window = 0x18002000;
+        if (mode >= 8 && core_fault == 7) expected_window = 0x18103000;
+        if (mode >= 8 && (core_fault == 8 || core_fault == 9)) expected_window = 0x18002000;
+        if (mode == 9 && tcm_fault == 5) expected_window = 0x18002000;
         assert(memory[9][0x2010/4] == expected_bar && memory[9][0x2014/4] == (chip_fault == 12 ? 1u : 0));
         assert(memory[9][0x2080/4] == expected_window);
     }
@@ -652,6 +687,50 @@ int main(void) {
     reset(8, 0); erom[132] = 0; erom[133] = 0xf; b2l_wifi_diag_start(); verify_quiet();
     assert(erom_reads == 134 && !wrapper_reads[0] && !strstr(logs, "core snapshot begin:"));
     puts("Core state: measured EROM witnesses, fixed read-only wrappers, gated/reset R4 rejection and dropped-write/cleanup failures passed");
+    mode = 9;
+    reset(8, 0); b2l_wifi_diag_start(); verify_quiet();
+    assert(bank_reads == 13 && bank_writes == 14 && bank_index == 7);
+    /* Five 4-KiB banks and eight 128-KiB banks cover both unit-size encodings. */
+    assert(strstr(logs, "TCM inventory end: stage=complete banks=13 bytes=1069056 selector_restore=verified"));
+    unsigned tcm_writes = writes;
+    for (unsigned failure = 1; failure <= tcm_writes; failure++) {
+        reset(8, 0); drop_write = failure; b2l_wifi_diag_start(); verify_quiet();
+        assert(bank_reads <= 13 && bank_index == 7);
+        assert(!strstr(logs, "selector_restore=FAILED"));
+    }
+    for (unsigned fault = 1; fault <= 11; fault++) {
+        reset(8, 0); tcm_fault = fault;
+        if (fault == 10) wrapper_values[1][0] = 1; /* Running R4: no selector access. */
+        b2l_wifi_diag_start(); verify_quiet();
+        if (fault == 1 || (fault >= 8 && fault <= 10)) assert(!bank_writes && !bank_reads);
+        if (fault == 2) assert(bank_reads == 1 && bank_index == 7);
+        if (fault == 3) assert(bank_reads == 6 && bank_index == 7);
+        if (fault == 4) assert(bank_reads == 1 && bank_index == 7);
+        if (fault == 5) assert(bank_reads == 1 && bank_index == 0);
+        if (fault == 6) assert(bank_reads == 13 && bank_index == 12 && bank_writes == 16);
+        if (fault == 7) assert(!bank_reads && bank_writes == 2 && bank_index == 7);
+        if (fault == 11) assert(!bank_reads && bank_writes == 2 && bank_index == 7);
+        if (fault == 5 || fault == 6) {
+            assert(strstr(logs, "selector_restore=FAILED") && strstr(logs, "cleanup=FAILED"));
+            assert(strstr(logs, "power probe restore verified"));
+        } else assert(bank_index == 7 && strstr(logs, "Gen1 quiesce verified"));
+    }
+    for (unsigned i = 0; i < 8; i++) {
+        reset(8, 0); erom[witness_offsets[i]/4] ^= 0x1000; b2l_wifi_diag_start(); verify_quiet();
+        assert(!wrapper_reads[0] && !bank_reads && !bank_writes);
+    }
+    reset(8, 0); erom[132] = 0; erom[133] = 0xf; b2l_wifi_diag_start(); verify_quiet();
+    assert(!wrapper_reads[0] && !bank_reads && !bank_writes);
+    /* Same clock/forced-clock/reset guards also apply to the mutation mode. */
+    for (unsigned fault = 1; fault <= 3; fault++) {
+        reset(8, 0);
+        if (fault == 1) wrapper_values[1][0] = 0;
+        if (fault == 2) wrapper_values[1][0] = 0x23;
+        if (fault == 3) wrapper_values[1][2] = 1;
+        b2l_wifi_diag_start(); verify_quiet();
+        assert(!bank_reads && !bank_writes && strstr(logs, "TCM inventory skipped:"));
+    }
+    puts("TCM inventory: halted measured R4, selector-only writes, bounded 13-bank sizing, both units and selector restoration/fault guards passed");
 }
 '''
 

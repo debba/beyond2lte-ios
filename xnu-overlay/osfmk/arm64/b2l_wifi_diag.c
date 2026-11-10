@@ -19,6 +19,8 @@
  * its address descriptors or reading its control registers.
  * b2l_wifi_diag=8 checks measured EROM witnesses, reads fixed R4/PCIe wrapper
  * state, and reads R4 capabilities only when the vendor core-up test passes.
+ * b2l_wifi_diag=9 also inventories TCM banks on the measured halted R4,
+ * temporarily changing only BANKIDX and restoring its original value.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -277,12 +279,13 @@ wifi_backplane_window(struct wifi_region *regions, uint32_t window, uint64_t dea
 }
 
 static int
-wifi_core_snapshot(struct wifi_region *regions)
+wifi_core_snapshot(struct wifi_region *regions, uint32_t *r4_cap, unsigned *r4_halted)
 {
     const struct wifi_region *bar = &regions[10];
     static const uint32_t wrappers[] = { 0x18103000, 0x18102000 };
     static const unsigned offsets[] = { 0x408, 0x500, 0x800 };
     uint32_t values[2][3] = { { 0 } };
+    *r4_cap = *r4_halted = 0;
     uint64_t deadline;
     clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
     wlog("core snapshot begin: measured PCIe2/R4 wrappers; no core clock/reset writes\n");
@@ -305,10 +308,73 @@ wifi_core_snapshot(struct wifi_region *regions)
         uint32_t cap = wifi_read(bar, 4); /* sbhndarm.h: corecapabilities. */
         wlog("R4 core capabilities=%#x; bank indices and RAM untouched\n", cap);
         if (cap == UINT32_MAX) return -1;
+        *r4_cap = cap;
+        *r4_halted = !!(values[1][0] & 0x20u);
     } else wlog("R4 capabilities skipped: core-up prerequisites absent\n");
     wlog("core snapshot complete: wrappers=2 R4_capabilities=%s; no chip writes or firmware\n",
         r4_up ? "read" : "skipped");
     return 0;
+}
+
+static int
+wifi_tcm_index(struct wifi_region *regions, uint32_t index, uint64_t deadline)
+{
+    if (!wifi_bar_ready(regions, 0x18002000, deadline)) return -1;
+    wifi_write(&regions[10], 0x40, index);
+    if (!wifi_bar_ready(regions, 0x18002000, deadline)) return -1;
+    return wifi_read(&regions[10], 0x40) == index ? 0 : -1;
+}
+
+static int
+wifi_tcm_inventory(struct wifi_region *regions, int *restore_failed)
+{
+    const struct wifi_region *bar = &regions[10];
+    uint32_t original = 0, bytes = 0;
+    unsigned read_banks = 0;
+    int changed = 0, restored = 1, result = -1;
+    uint64_t deadline;
+    /* Only the measured capability word is admitted by the caller: 5 TCMA
+     * and 8 TCMB banks. si_tcm_size selects BANKIDX then reads BANKINFO.
+     * We never reset/clock the core, write BANKPDA, or access TCM contents. */
+    clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+    if (!wifi_bar_ready(regions, 0x18002000, deadline)) goto out;
+    original = wifi_read(bar, 0x40);
+    if (original >= 13) {
+        wlog("TCM inventory skipped: original BANKIDX=%#x outside measured 13 banks\n", original);
+        goto out;
+    }
+    wlog("TCM inventory begin: TCMA=5 TCMB=8 original_BANKIDX=%u; selector writes only\n", original);
+    for (unsigned bank = 0; bank < 13; bank++) {
+        /* Mark owned before attempting a posted write, including lost writes. */
+        changed = 1;
+        if (wifi_tcm_index(regions, bank, deadline) ||
+            !wifi_bar_ready(regions, 0x18002000, deadline)) goto out;
+        uint32_t info = wifi_read(bar, 0x44);
+        if (info == UINT32_MAX) goto out;
+        uint32_t size = ((info & 0x7fu) + 1u) * ((info & 0x200u) ? 1024u : 8192u);
+        bytes += size;
+        read_banks++;
+        wlog("TCM bank=%u info=%#x bytes=%u; no RAM access\n", bank, info, size);
+    }
+    result = 0;
+out:
+    if (changed) {
+        restored = 0;
+        /* A separate bounded cleanup budget still checks live link/BAR state.
+         * Loss of access forbids further chip writes; parent powers down. */
+        clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+        for (unsigned attempt = 0; attempt < 3; attempt++) {
+            if (!wifi_tcm_index(regions, original, deadline)) {
+                restored = 1; break;
+            }
+            delay_for_interval(1, NSEC_PER_MSEC);
+        }
+    }
+    if (!restored) *restore_failed = -1;
+    wlog("TCM inventory end: stage=%s banks=%u bytes=%u selector_restore=%s; no RAM/firmware\n",
+        result ? "incomplete" : "complete", read_banks, bytes,
+        changed ? (restored ? "verified" : "FAILED") : "unchanged");
+    return result || !restored ? -1 : 0;
 }
 
 static int
@@ -323,6 +389,8 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
     uint32_t words[3] = { 0 }, low = 0, high = 0, window = 0, command = 0;
     int atu_owned = 0, ep_changed = 0, cleanup_failed = 0, cfg_selected = 0;
     unsigned erom_words = 0, target_signature = 0;
+    uint32_t r4_cap = 0;
+    unsigned r4_halted = 0;
     const char *stage = "initial-state";
     uint64_t deadline;
     clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
@@ -391,7 +459,7 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
             wifi_ep_memory_command(regions, 2, deadline)) goto out;
         stage = "erom-capture";
         if (wifi_erom_capture(regions, &erom_words, &target_signature)) goto out;
-        if (mode == 8) {
+        if (mode >= 8) {
             stage = "core-prerequisites";
             if (erom_words != 133 || target_signature != 0xff) {
                 wlog("core snapshot skipped: measured EROM witnesses/count differ words=%u signature=%#x\n",
@@ -399,7 +467,17 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
                 goto out;
             }
             stage = "core-snapshot";
-            if (wifi_core_snapshot(regions)) goto out;
+            if (wifi_core_snapshot(regions, &r4_cap, &r4_halted)) goto out;
+            if (mode == 9) {
+                stage = "tcm-prerequisites";
+                if (!r4_halted || r4_cap != 0x351585) {
+                    wlog("TCM inventory skipped: measured halted-R4/capability prerequisites absent cap=%#x halted=%u\n",
+                        r4_cap, r4_halted);
+                    goto out;
+                }
+                stage = "tcm-inventory";
+                if (wifi_tcm_inventory(regions, &cleanup_failed)) goto out;
+            }
         }
     }
     stage = "complete";
@@ -790,7 +868,7 @@ b2l_wifi_diag_start(void)
     static const unsigned qch[] = { 0x3034, 0x3038, 0x303c, 0x3040, 0x3044 };
     unsigned count = 4;
 
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 8) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 9) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }

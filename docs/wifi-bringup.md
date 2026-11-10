@@ -320,12 +320,12 @@ rtk proxy python3 scripts/decode-b2l-erom.py /private/path/epoch-console.txt
 
 ## Read-only core state
 
-The userspace loader now selects `b2l_wifi_diag=8`. It repeats the capture and
+`b2l_wifi_diag=8` repeats the capture and
 requires 133 words plus eight exact measured CIA/CIB/register-base/wrapper
 witnesses for the two fixed targets. This is an additional guard for the
 already validated targets, not a replacement for the host table decoder.
-Any changed witness/count skips all following component access. The physical
-outcome of this additional checkpoint is pending.
+Any changed witness/count skips all following component access. This checkpoint
+completed on the phone with interactive Home and all cleanup checks verified.
 
 The probe switches the existing BAR0 window, with memory decoding off during
 each switch, to PCIe2 wrapper `0x18103000` and R4 wrapper `0x18102000`. It reads
@@ -340,6 +340,34 @@ at `0x04`. Otherwise it logs a skipped capability read. CPUHALT is reported
 from IOCTRL bit 5 and is never modified. A successful state snapshot does not
 mean the core is ready for firmware or that RAM banks have been sized.
 All existing BAR/window/ATU/PHY/power cleanup still runs on success or error.
+
+The measured PCIe2 wrapper has IOCTRL `0x1`, IOSTATUS `0x0`, RESETCTRL `0x0`.
+R4 has IOCTRL `0x21`, IOSTATUS `0x0`, RESETCTRL `0x0`: its clock is enabled,
+reset is released, and CPUHALT is set. R4 capabilities read `0x351585`.
+The low two nibbles declare 5 TCM-A and 8 TCM-B banks; their sizes have not yet
+been measured. Bank count alone does not establish memory capacity or power state.
+
+## TCM bank inventory
+
+The userspace loader now selects `b2l_wifi_diag=9`. It repeats all preceding
+checks and additionally requires the exact measured capabilities `0x351585`
+and an active R4 with CPUHALT set. It never forces that state. Changed EROM,
+capabilities, clock/reset or CPUHALT prerequisites skip all selector access.
+The physical outcome of this additional checkpoint is pending.
+
+Following Broadcom's `si_tcm_size`, the inventory selects each of the 13 banks
+through R4 BANKIDX `0x40` and reads BANKINFO `0x44`. The original selector must
+be within those 13 banks. Each write is guarded and read back; every access
+uses the existing link/BAR/window guards and a 100 ms inventory deadline.
+Size is `(BANKINFO[6:0] + 1)` times 1 KiB when bit 9 is set, otherwise 8 KiB.
+The result measures the capacity reported by BANKINFO, not bank power state.
+
+BANKIDX is the only chip register written. The probe saves its original value
+before modification and restores it on success or failure, with at most three
+attempts within a separate 100 ms cleanup budget. If access disappears it
+reports failed restoration and still attempts normal parent power cleanup.
+It never writes BANKPDA, core clocks/resets, RAM, firmware, DMA or IRQ registers.
+All existing BAR/window/ATU/PHY/power cleanup remains active.
 
 ## Recovery evidence
 
@@ -365,9 +393,9 @@ open; no random variant is used.
 
 ## Following checkpoints
 
-1. Validate the read-only wrapper/core-state snapshot and all cleanup,
-   preserving the validated EROM BOOT as rollback.
-2. Establish a controlled firmware-download core state and enabled RAM banks,
+1. Validate the TCM bank inventory, selector restoration and all cleanup,
+   preserving the validated core-state BOOT as rollback.
+2. Establish a controlled firmware-download state and usable RAM range,
    select verified board firmware/NVRAM,
    and bring up firmware with an appropriate DMA/SysMMU design.
 3. Establish scanning, authentication, packet transport and DHCP, then adapt
@@ -437,6 +465,12 @@ fixed wrapper read scope, gated/forced-clock/reset R4 capability rejection,
 invalid state/capability words, deadline/link loss, every dropped write in the
 new path, and failed final cleanup. The backend permits no component writes.
 
+Mode 9 permits only BANKIDX writes on the measured halted R4. Tests cover
+all 13 banks, both size-unit encodings, changed capability/EROM witnesses,
+running/gated/reset R4, invalid original selector/BANKINFO, deadlines before
+and after a selector write, link loss, every lost write, and failed selector
+restoration with bounded retries and continued parent power restoration.
+
 ## Source references
 
 Samsung/LineageOS is pinned to
@@ -457,6 +491,8 @@ Samsung/LineageOS is pinned to
 - [AI EROM format and control-register boundary](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/aidmp.h)
 - [Broadcom AI EROM scan](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/aiutils.c)
 - [ARM R4 register layout](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/sbhndarm.h)
+- [TCM bank inventory algorithm](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/siutils.c)
+- [R4 bank fields and offsets](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/siutils.h)
 - [Clock register bases, offsets and fields](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/soc/samsung/cal-if/exynos9820/cmucal-sfr.c)
 - [WLAN power and PCIe channel setup](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_custom_exynos.c)
 
